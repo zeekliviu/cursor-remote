@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import type {
   ChatChangedFile,
   ChatDetail,
+  ChatImage,
   ChatMessage,
   ChatSummary,
   Project,
@@ -18,6 +19,13 @@ type ComposerData = {
   lastUpdatedAt?: number;
   unifiedMode?: string;
   filesChangedCount?: number;
+  isDraft?: boolean;
+  isAgentic?: boolean;
+  isBestOfNSubcomposer?: boolean;
+  isBestOfNParent?: boolean;
+  isSpec?: boolean;
+  subComposerIds?: string[];
+  subagentComposerIds?: string[];
   newlyCreatedFiles?: Array<{ uri?: { fsPath?: string; path?: string; external?: string } }>;
   originalFileStates?: Record<
     string,
@@ -104,6 +112,171 @@ function basenamePath(p: string): string {
   return parts[parts.length - 1] || p;
 }
 
+const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|heic)$/i;
+const PHONE_ATTACH_RE =
+  /\[Phone attachments — read on host:\s*([^\](]+?)(?:\s*\([^)]*\))?\]/gi;
+
+function isImagePath(p: string): boolean {
+  return IMAGE_EXT_RE.test(p.trim());
+}
+
+function mimeForImagePath(p: string): string | undefined {
+  const ext = path.extname(p).toLowerCase();
+  if (ext === ".png") return "image/png";
+  if (ext === ".jpg" || ext === ".jpeg") return "image/jpeg";
+  if (ext === ".gif") return "image/gif";
+  if (ext === ".webp") return "image/webp";
+  if (ext === ".bmp") return "image/bmp";
+  if (ext === ".heic") return "image/heic";
+  return undefined;
+}
+
+function parseJsonObject(raw: unknown): Record<string, unknown> | null {
+  if (!raw) return null;
+  if (typeof raw === "object" && !Array.isArray(raw)) {
+    return raw as Record<string, unknown>;
+  }
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+function extractImagePathFromTool(params: unknown, rawArgs?: unknown): string | null {
+  const obj = parseJsonObject(params) || parseJsonObject(rawArgs);
+  if (!obj) return null;
+  for (const key of [
+    "targetFile",
+    "effectiveUri",
+    "path",
+    "relativeWorkspacePath",
+    "file",
+  ]) {
+    const v = obj[key];
+    if (typeof v === "string" && isImagePath(v)) return v;
+  }
+  return null;
+}
+
+function extractPhoneAttachmentPaths(text: string): {
+  paths: string[];
+  cleaned: string;
+} {
+  const paths: string[] = [];
+  const cleaned = text
+    .replace(PHONE_ATTACH_RE, (_, p: string) => {
+      const trimmed = String(p || "").trim();
+      if (trimmed && isImagePath(trimmed)) paths.push(trimmed);
+      return "";
+    })
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return { paths, cleaned };
+}
+
+/** Cursor stores Composer images under workspaceStorage/<id>/images/<uuid>-….ext */
+function resolveImageUuid(
+  workspaceStorage: string,
+  uuid: string,
+): string | null {
+  if (!uuid || !fs.existsSync(workspaceStorage)) return null;
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(workspaceStorage);
+  } catch {
+    return null;
+  }
+  for (const ws of entries) {
+    const imgDir = path.join(workspaceStorage, ws, "images");
+    if (!fs.existsSync(imgDir)) continue;
+    let files: string[] = [];
+    try {
+      files = fs.readdirSync(imgDir);
+    } catch {
+      continue;
+    }
+    const match = files.find(
+      (f) => f.startsWith(uuid) && isImagePath(f),
+    );
+    if (match) return path.join(imgDir, match);
+  }
+  return null;
+}
+
+function chatImageFromPath(
+  filePath: string,
+  dims?: { width?: number; height?: number },
+): ChatImage | null {
+  const resolved = path.resolve(filePath);
+  if (!isImagePath(resolved)) return null;
+  if (!fs.existsSync(resolved)) return null;
+  return {
+    path: resolved,
+    name: basenamePath(resolved),
+    mime: mimeForImagePath(resolved),
+    width: dims?.width,
+    height: dims?.height,
+  };
+}
+
+function mergeImages(
+  into: ChatImage[] | undefined,
+  add: ChatImage[],
+): ChatImage[] {
+  const out = [...(into || [])];
+  const seen = new Set(out.map((i) => i.path.toLowerCase()));
+  for (const img of add) {
+    const key = img.path.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(img);
+  }
+  return out;
+}
+
+/**
+ * Fold image-only read tools onto the preceding user bubble and drop them from
+ * the tool stream so Expo shows photos under the user's message.
+ */
+function attachImagesToUserMessages(messages: ChatMessage[]): ChatMessage[] {
+  const out: ChatMessage[] = [];
+  for (const m of messages) {
+    const toolPath =
+      m.role === "tool" || m.hasTools
+        ? extractImagePathFromTool(m.tool?.params)
+        : null;
+    const isImageRead =
+      Boolean(toolPath) &&
+      (m.tool?.name === "read_file_v2" || m.tool?.name === "read_file");
+
+    if (isImageRead && toolPath) {
+      const img = chatImageFromPath(toolPath);
+      if (img) {
+        for (let i = out.length - 1; i >= 0; i--) {
+          if (out[i].role === "user") {
+            out[i] = {
+              ...out[i],
+              images: mergeImages(out[i].images, [img]),
+            };
+            break;
+          }
+        }
+        // Skip rendering this as a tool row — the photo sits on the user bubble.
+        continue;
+      }
+    }
+    out.push(m);
+  }
+  return out;
+}
+
 export class CursorStore {
   constructor(private readonly paths: CursorPaths) {}
 
@@ -145,13 +318,27 @@ export class CursorStore {
     const project = this.getProject(projectId);
     if (!project) return [];
 
+    const childIds = this.collectSubagentComposerIds();
+
+    let list: ChatSummary[] = [];
     const fromWorkspace = this.chatsFromWorkspaceDb(projectId);
-    if (fromWorkspace.length > 0) return fromWorkspace;
+    if (fromWorkspace.length > 0) list = fromWorkspace;
+    else {
+      const fromGlobal = this.chatsFromGlobalComposerData(
+        projectId,
+        project.path,
+      );
+      if (fromGlobal.length > 0) list = fromGlobal;
+      else list = this.chatsFromSearchIndex(projectId);
+    }
 
-    const fromGlobal = this.chatsFromGlobalComposerData(projectId, project.path);
-    if (fromGlobal.length > 0) return fromGlobal;
-
-    return this.chatsFromSearchIndex(projectId);
+    return this.annotateMessageable(list, childIds).sort((a, b) => {
+      // Messageable first, then recency
+      if (Boolean(a.messageable) !== Boolean(b.messageable)) {
+        return a.messageable ? -1 : 1;
+      }
+      return (b.lastUpdatedAt || 0) - (a.lastUpdatedAt || 0);
+    });
   }
 
   getChat(chatId: string): ChatDetail | null {
@@ -187,10 +374,16 @@ export class CursorStore {
           createdAt?: string;
           thinking?: { text?: string };
           thinkingDurationMs?: number;
+          images?: Array<{
+            uuid?: string;
+            path?: string;
+            dimension?: { width?: number; height?: number };
+          }>;
           toolFormerData?: {
             name?: string;
             status?: string;
             params?: unknown;
+            rawArgs?: unknown;
             result?: unknown;
             additionalData?: unknown;
           };
@@ -199,7 +392,37 @@ export class CursorStore {
         const thinkingText = (bubble.thinking?.text || "").trim();
         const tfd = bubble.toolFormerData;
         const hasTools = Boolean(tfd);
-        if (!text && !hasTools && !thinkingText) continue;
+
+        const bubbleImages: ChatImage[] = [];
+        for (const img of bubble.images || []) {
+          if (img.path && isImagePath(img.path)) {
+            const resolved = chatImageFromPath(img.path, img.dimension);
+            if (resolved) bubbleImages.push(resolved);
+            continue;
+          }
+          if (img.uuid) {
+            const filePath = resolveImageUuid(
+              this.paths.workspaceStorage,
+              img.uuid,
+            );
+            if (filePath) {
+              const resolved = chatImageFromPath(filePath, img.dimension);
+              if (resolved) bubbleImages.push(resolved);
+            }
+          }
+        }
+        if (text) {
+          const phone = extractPhoneAttachmentPaths(text);
+          for (const p of phone.paths) {
+            const resolved = chatImageFromPath(p);
+            if (resolved) bubbleImages.push(resolved);
+          }
+          if (phone.paths.length) text = phone.cleaned;
+        }
+
+        if (!text && !hasTools && !thinkingText && bubbleImages.length === 0) {
+          continue;
+        }
 
         // Agent harness noise stored as type=1 "user" bubbles
         if (bubble.type === 1 && text && isAgentSystemNoise(text)) {
@@ -374,16 +597,22 @@ export class CursorStore {
             text ||
             (tool
               ? `${toolLabel}${tool.status ? ` (${tool.status})` : ""}`
-              : "[tool call]"),
+              : bubbleImages.length
+                ? ""
+                : "[tool call]"),
           createdAt: bubble.createdAt || h.createdAt,
           hasTools,
           tool,
           thinking: thinkingText || undefined,
           thinkingDurationMs: bubble.thinkingDurationMs,
+          images: bubbleImages.length ? bubbleImages : undefined,
         });
       }
 
-      const filesChanged = this.buildFilesChanged(data, readKv);
+      const withImages = attachImagesToUserMessages(messages);
+      const filesChanged = this.buildFilesChangedFromLatestTurn(withImages);
+      const childIds = this.collectSubagentComposerIds();
+      const messageable = this.isMessageableComposer(chatId, data, childIds);
 
       return {
         id: chatId,
@@ -392,14 +621,73 @@ export class CursorStore {
         createdAt: data.createdAt,
         lastUpdatedAt: data.lastUpdatedAt,
         mode: data.unifiedMode,
-        messages,
-        filesChangedCount:
-          data.filesChangedCount ?? filesChanged.length ?? undefined,
+        messageable,
+        messages: withImages,
+        filesChangedCount: filesChanged.length || undefined,
         filesChanged,
       };
     } finally {
       globalDb.close();
     }
+  }
+
+  /**
+   * Files changed for the latest assistant turn only — matches Cursor's
+   * "N File(s) Changed" card under the last response (not the whole chat).
+   */
+  private buildFilesChangedFromLatestTurn(
+    messages: ChatMessage[],
+  ): ChatChangedFile[] {
+    const byPath = new Map<string, ChatChangedFile>();
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i];
+      if (m.role === "user") break;
+      const tool = m.tool;
+      if (!tool?.name) continue;
+      if (
+        !/edit|write|search_replace|apply_patch|create_file|delete_file|StrReplace|Write|Delete/i.test(
+          tool.name,
+        )
+      ) {
+        continue;
+      }
+      let filePath = "";
+      if (tool.params) {
+        try {
+          const p = JSON.parse(tool.params) as Record<string, unknown>;
+          filePath = String(
+            p.relativeWorkspacePath ||
+              p.targetFile ||
+              p.path ||
+              p.file ||
+              p.uri ||
+              "",
+          );
+        } catch {
+          filePath = "";
+        }
+      }
+      if (!filePath && tool.diffPatch) {
+        const m2 = tool.diffPatch.match(/^\+\+\+\s+b\/(.+)$/m);
+        if (m2) filePath = m2[1];
+      }
+      if (!filePath) continue;
+      const prev = byPath.get(filePath);
+      byPath.set(filePath, {
+        path: filePath,
+        additions:
+          tool.additions != null || prev?.additions != null
+            ? (prev?.additions || 0) + (tool.additions || 0)
+            : undefined,
+        deletions:
+          tool.deletions != null || prev?.deletions != null
+            ? (prev?.deletions || 0) + (tool.deletions || 0)
+            : undefined,
+        patch: tool.diffPatch || prev?.patch,
+        isNew: /create_file|^Write$/i.test(tool.name) || prev?.isNew,
+      });
+    }
+    return [...byPath.values()].sort((a, b) => a.path.localeCompare(b.path));
   }
 
   /** Diff for one changed file vs its original snapshot in Cursor storage. */
@@ -493,6 +781,78 @@ export class CursorStore {
     return out
       .sort((a, b) => a.path.localeCompare(b.path))
       .slice(0, onlyPath ? 1 : 80);
+  }
+
+  /**
+   * Subagent / explore transcripts are referenced from a parent agent and
+   * have no Composer input in Cursor — treat as view-only.
+   */
+  private collectSubagentComposerIds(): Set<string> {
+    const out = new Set<string>();
+    const db = openReadonly(this.paths.globalDb);
+    if (!db) return out;
+    try {
+      const rows = db
+        .prepare(
+          "SELECT value FROM cursorDiskKV WHERE key LIKE 'composerData:%'",
+        )
+        .all() as Array<{ value: string }>;
+      for (const row of rows) {
+        try {
+          const data = JSON.parse(row.value) as ComposerData;
+          for (const id of data.subagentComposerIds || []) {
+            if (id) out.add(id);
+          }
+          for (const id of data.subComposerIds || []) {
+            if (id) out.add(id);
+          }
+        } catch {
+          // skip bad rows
+        }
+      }
+    } finally {
+      db.close();
+    }
+    return out;
+  }
+
+  private isMessageableComposer(
+    chatId: string,
+    data: ComposerData | undefined,
+    childIds: Set<string>,
+  ): boolean {
+    if (childIds.has(chatId)) return false;
+    if (data?.isBestOfNSubcomposer) return false;
+    return true;
+  }
+
+  private annotateMessageable(
+    list: ChatSummary[],
+    childIds: Set<string>,
+  ): ChatSummary[] {
+    const db = openReadonly(this.paths.globalDb);
+    const dataById = new Map<string, ComposerData>();
+    if (db) {
+      try {
+        for (const c of list) {
+          const row = db
+            .prepare("SELECT value FROM cursorDiskKV WHERE key = ?")
+            .get(`composerData:${c.id}`) as { value: string } | undefined;
+          if (!row) continue;
+          try {
+            dataById.set(c.id, JSON.parse(row.value) as ComposerData);
+          } catch {
+            // skip
+          }
+        }
+      } finally {
+        db.close();
+      }
+    }
+    return list.map((c) => ({
+      ...c,
+      messageable: this.isMessageableComposer(c.id, dataById.get(c.id), childIds),
+    }));
   }
 
   private chatsFromWorkspaceDb(projectId: string): ChatSummary[] {

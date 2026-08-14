@@ -21,6 +21,8 @@ import { ensureDir, resolveCursorPaths } from "./paths.js";
 import { pickAdvertiseHost, detectAdvertiseHosts } from "./advertise-host.js";
 import { formatAttachmentsForPrompt, saveBase64Upload } from "./uploads.js";
 import { TerminalHub, ensurePtyPermissions } from "./terminal.js";
+import { activateCursorApp } from "./open-cursor.js";
+import { contentTypeForImage, isAllowedMediaPath } from "./media.js";
 
 export type DaemonOptions = {
   port?: number;
@@ -160,6 +162,25 @@ ${qrDataUrl ? `<p><img alt="pairing qr" src="${qrDataUrl}"/></p>` : ""}
     res.json(file);
   });
 
+  /** Serve chat attachment / screenshot images from the host disk. */
+  app.get("/media", (req, res) => {
+    const filePath = String(req.query.path || "");
+    if (!filePath) {
+      res.status(400).json({ error: "path required" });
+      return;
+    }
+    const check = isAllowedMediaPath(filePath, paths, dataDir);
+    if (!check.ok) {
+      res.status(check.error === "not found" ? 404 : 403).json({
+        error: check.error,
+      });
+      return;
+    }
+    res.setHeader("Content-Type", contentTypeForImage(check.resolved));
+    res.setHeader("Cache-Control", "private, max-age=3600");
+    fs.createReadStream(check.resolved).pipe(res);
+  });
+
   app.get("/projects/:id/diff", async (req, res) => {
     const project = store.getProject(req.params.id);
     if (!project) {
@@ -212,11 +233,103 @@ ${qrDataUrl ? `<p><img alt="pairing qr" src="${qrDataUrl}"/></p>` : ""}
 
   app.post("/composer/select", async (req, res) => {
     try {
-      const window = await cdp.selectWindow(req.body?.targetId);
-      if (req.body?.chatName) {
-        await cdp.selectChatByName(String(req.body.chatName));
+      await activateCursorApp();
+      const projectId =
+        typeof req.body?.projectId === "string" ? req.body.projectId : undefined;
+      const project = projectId ? store.getProject(projectId) : undefined;
+      const result = await cdp.selectComposerContext({
+        targetId: req.body?.targetId,
+        chatId: req.body?.chatId ? String(req.body.chatId) : undefined,
+        chatName: req.body?.chatName
+          ? String(req.body.chatName)
+          : undefined,
+        projectPath:
+          (typeof req.body?.projectPath === "string" && req.body.projectPath) ||
+          project?.path,
+        projectName:
+          (typeof req.body?.projectName === "string" && req.body.projectName) ||
+          project?.name,
+        skipActivate: true,
+        // Bind via Agents → Repositories (never Open Recent / never type).
+        switchIfNeeded: true,
+        requireProjectMatch: false,
+      });
+      res.json({
+        window: result.window,
+        chatSelected: result.chatSelected,
+        matchedBy: result.matchedBy,
+        repoSelected: result.repoSelected,
+      });
+    } catch (err) {
+      res.status(503).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post("/composer/new-chat", async (req, res) => {
+    try {
+      const projectId =
+        typeof req.body?.projectId === "string" ? req.body.projectId : undefined;
+      const project = projectId ? store.getProject(projectId) : undefined;
+      if (projectId && !project) {
+        res.status(404).json({ error: "project not found" });
+        return;
       }
-      res.json({ window });
+      // Switch via Agents → Repositories left panel (never spawn / Open Recent).
+      if (project) {
+        await cdp.selectComposerContext({
+          projectPath: project.path,
+          projectName: project.name,
+          switchIfNeeded: true,
+          requireProjectMatch: true,
+        });
+      }
+      const result = await cdp.newChat({
+        projectPath: project?.path,
+        projectName: project?.name,
+        targetId: req.body?.targetId,
+        switchIfNeeded: false,
+      });
+      res.json(result);
+    } catch (err) {
+      res.status(503).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post("/composer/stop", async (_req, res) => {
+    try {
+      const ok = await cdp.stopGeneration();
+      res.json({ ok });
+    } catch (err) {
+      res.status(503).json({ error: (err as Error).message });
+    }
+  });
+
+  app.post("/projects/:id/open", async (req, res) => {
+    const project = store.getProject(req.params.id);
+    if (!project) {
+      res.status(404).json({ error: "project not found" });
+      return;
+    }
+    try {
+      await activateCursorApp();
+      // Click the repo in Agents → Repositories (same window, no Open Recent).
+      const result = await cdp.selectComposerContext({
+        projectPath: project.path,
+        projectName: project.name,
+        skipActivate: true,
+        switchIfNeeded: true,
+        requireProjectMatch: true,
+      });
+      res.json({
+        ok: true,
+        message:
+          result.matchedBy === "agentsPanel"
+            ? `Selected ${project.name} in Agents → Repositories`
+            : `Focused Cursor for ${project.name}`,
+        window: result.window,
+        matchedBy: result.matchedBy,
+        repoSelected: result.repoSelected,
+      });
     } catch (err) {
       res.status(503).json({ error: (err as Error).message });
     }
@@ -243,6 +356,35 @@ ${qrDataUrl ? `<p><img alt="pairing qr" src="${qrDataUrl}"/></p>` : ""}
       return;
     }
     try {
+      const projectId =
+        typeof req.body?.projectId === "string" ? req.body.projectId : undefined;
+      const project = projectId ? store.getProject(projectId) : undefined;
+      const chatName =
+        typeof req.body?.chatName === "string" ? req.body.chatName : undefined;
+      const chatId =
+        typeof req.body?.chatId === "string" ? req.body.chatId : undefined;
+      if (project || chatName || chatId || req.body?.targetId) {
+        const bind = await cdp.selectComposerContext({
+          targetId: req.body?.targetId,
+          chatId,
+          chatName,
+          projectPath: project?.path,
+          projectName: project?.name,
+          switchIfNeeded: true,
+          requireProjectMatch: Boolean(project),
+        });
+        if (
+          project &&
+          bind.matchedBy === "fallback" &&
+          !bind.repoSelected &&
+          !bind.chatSelected
+        ) {
+          res.status(409).json({
+            error: `Refusing to send — could not select ${project.name} in Agents → Repositories. Open the Agents sidebar in Cursor, then retry.`,
+          });
+          return;
+        }
+      }
       await cdp.sendMessage(full, req.body?.submit !== false);
       res.json({ ok: true });
     } catch (err) {
@@ -458,6 +600,8 @@ function buildPairing(bindHost: string, port: number, token: string): PairingInf
 
 function handleComposerWs(ws: WebSocket, cdp: CdpDriver): void {
   let timer: NodeJS.Timeout | null = null;
+  let lastActivity = "\u0000";
+  let lastConfirmKey = "\u0000";
 
   const stop = () => {
     if (timer) clearInterval(timer);
@@ -482,6 +626,8 @@ function handleComposerWs(ws: WebSocket, cdp: CdpDriver): void {
         if (msg.targetId) await cdp.selectWindow(msg.targetId);
         sendComposer(ws, { type: "status", health: await cdp.health() });
         stop();
+        lastActivity = "\u0000";
+        lastConfirmKey = "\u0000";
         timer = setInterval(async () => {
           try {
             const event = await cdp.pollDomEvents();
@@ -493,8 +639,25 @@ function handleComposerWs(ws: WebSocket, cdp: CdpDriver): void {
                 at: Date.now(),
               });
             }
+            const activity = await cdp.scrapeAgentActivity().catch(() => null);
+            if (activity) {
+              const key = `${activity.running ? 1 : 0}|${activity.status || ""}|${activity.currentModel || ""}`;
+              if (key !== lastActivity) {
+                lastActivity = key;
+                sendComposer(ws, {
+                  type: "activity",
+                  status: activity.status,
+                  currentModel: activity.currentModel,
+                  running: activity.running,
+                  at: Date.now(),
+                });
+              }
+            }
             const items = await cdp.listConfirmations();
-            if (items.length) {
+            // Push transitions in both directions so clients can clear stale cards.
+            const confirmKey = items.map((i) => i.id).join(",");
+            if (confirmKey !== lastConfirmKey) {
+              lastConfirmKey = confirmKey;
               sendComposer(ws, { type: "confirmations", items });
             }
           } catch (err) {

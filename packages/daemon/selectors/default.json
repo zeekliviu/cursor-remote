@@ -22,7 +22,38 @@
     "[data-composer-id]",
     ".composer-sidebar-item",
     "[class*='conversation-title']",
-    "[class*='ComposerListItem']"
+    "[class*='ComposerListItem']",
+    "[class*='agent'] [class*='chat']",
+    "[class*='AgentSidebar'] [class*='item']"
+  ],
+  "agentsPanel": [
+    "[aria-label*='Repositories']",
+    "[class*='agent-sidebar']",
+    "[class*='AgentSidebar']",
+    "[class*='agents-sidebar']",
+    "[data-testid*='agent-sidebar']",
+    "[class*='repository-list']"
+  ],
+  "agentsRepoRow": [
+    "[class*='repo']",
+    "[class*='repository']",
+    "[class*='workspace-item']",
+    "[data-testid*='repo']"
+  ],
+  "agentsChatRow": [
+    "[data-composer-id]",
+    "[class*='composer-row']",
+    "[class*='conversation']",
+    "[class*='chat-item']",
+    "[class*='agent-chat']"
+  ],
+  "agentsActivityButton": [
+    "a[aria-label*='Agent']",
+    "div[aria-label*='Agent']",
+    "button[aria-label*='Agent']",
+    ".action-item[aria-label*='Agent']",
+    "[class*='activitybar'] [aria-label*='Agent']",
+    "[class*='activity-bar'] [aria-label*='Agent']"
   ],
   "modelPickerButton": [
     ".ui-model-picker__trigger",
@@ -51,10 +82,33 @@
     "[role='dialog']",
     ".monaco-dialog-box",
     "[class*='confirmation']",
-    "[class*='modal']"
+    "[class*='Confirmation']",
+    "[class*='approval']",
+    "[class*='Approval']",
+    "[class*='pending-decision']",
+    "[class*='tool-call-card']",
+    "[data-testid*='confirm']",
+    "[data-testid*='approval']"
   ],
   "confirmationButtons": [
     "[role='dialog'] button",
-    ".monaco-dialog-box button"
+    ".monaco-dialog-box button",
+    "[class*='confirmation'] button",
+    "[class*='approval'] button"
+  ],
+  "newChatButton": [
+    "button[aria-label*='New Chat']",
+    "button[aria-label*='New chat']",
+    "a[aria-label*='New Chat']",
+    "[data-testid*='new-chat']",
+    "button[title*='New Chat']",
+    ".composer-new-chat-button"
+  ],
+  "stopButton": [
+    "button[aria-label*='Stop']",
+    "button[aria-label*='Cancel']",
+    "button[title*='Stop']",
+    "[data-testid*='stop']",
+    ".composer-stop-button"
   ]
 }
