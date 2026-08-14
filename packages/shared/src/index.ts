@@ -13,6 +13,11 @@ export type ChatSummary = {
   lastUpdatedAt?: number;
   mode?: string;
   isArchived?: boolean;
+  /**
+   * False for subagent / explore transcripts (no Composer input in Cursor).
+   * True for parent agent chats and normal composers you can message.
+   */
+  messageable?: boolean;
 };
 
 export type ChatMessage = {
@@ -36,6 +41,18 @@ export type ChatMessage = {
   /** Assistant reasoning / "Thought for Ns" body */
   thinking?: string;
   thinkingDurationMs?: number;
+  /** Attached / referenced images for this bubble (host absolute paths). */
+  images?: ChatImage[];
+};
+
+/** Image attached to a chat bubble (Composer paste, phone upload, or agent read). */
+export type ChatImage = {
+  /** Absolute path on the daemon host */
+  path: string;
+  name?: string;
+  width?: number;
+  height?: number;
+  mime?: string;
 };
 
 export type ChatChangedFile = {
@@ -72,6 +89,13 @@ export type CursorWindow = {
   title: string;
   url?: string;
   type: string;
+};
+
+export type ComposerBindResult = {
+  window: CursorWindow;
+  chatSelected?: boolean;
+  matchedBy?: "targetId" | "project" | "agentsPanel" | "fallback";
+  repoSelected?: boolean;
 };
 
 export type ComposerHealth = {
@@ -141,7 +165,12 @@ export type ConfirmationAction = {
 
 export type Confirmation = {
   id: string;
+  /** Short title, e.g. "Run command" */
   text: string;
+  /** Human-readable summary when available */
+  summary?: string;
+  /** Shell / tool command to approve */
+  command?: string;
   actions: ConfirmationAction[];
 };
 
@@ -178,6 +207,8 @@ export type ComposerServerMessage =
   | { type: "status"; health: ComposerHealth }
   | { type: "event"; kind: string; text?: string; at: number }
   | { type: "confirmations"; items: Confirmation[] }
+  /** Host agent status line; `status` is undefined when the agent is idle. */
+  | { type: "activity"; status?: string; currentModel?: string; running?: boolean; at: number }
   | { type: "error"; message: string }
   | { type: "pong" };
 
