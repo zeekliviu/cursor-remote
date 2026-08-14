@@ -1,0 +1,60 @@
+{
+  "name": "default",
+  "cursorVersionHint": "*",
+  "chatInput": [
+    "div.aislash-editor-input[contenteditable='true']",
+    "div[contenteditable='true'].ProseMirror",
+    "[data-lexical-editor='true']",
+    "div.composer-input-container [contenteditable='true']",
+    ".monaco-mouse-cursor-text textarea",
+    "textarea[placeholder*='Plan']",
+    "textarea[placeholder*='Ask']",
+    "textarea[placeholder*='Agent']",
+    "div[class*='composer'] [contenteditable='true']"
+  ],
+  "sendButton": [
+    "button[aria-label*='Send']",
+    "button[data-testid*='send']",
+    ".composer-submit-button",
+    "button[class*='send']"
+  ],
+  "chatListItem": [
+    "[data-composer-id]",
+    ".composer-sidebar-item",
+    "[class*='conversation-title']",
+    "[class*='ComposerListItem']"
+  ],
+  "modelPickerButton": [
+    ".ui-model-picker__trigger",
+    "button:has(.ui-model-picker__trigger-text)",
+    "[class*='model-picker__trigger']",
+    ".ui-prompt-input-toolbar button:has([class*='model-picker'])",
+    "[data-testid*='model-picker']",
+    "button[aria-label*='Model']",
+    "button[aria-label*='model']"
+  ],
+  "modelOption": [
+    ".ui-model-picker__item-content-name",
+    "[class*='model-picker__item-content-name']",
+    ".ui-model-picker__item-content",
+    "[class*='model-picker__menu'] [role='menuitem']",
+    "[class*='model-picker'] [role='menuitemradio']",
+    "[data-testid*='model-option']"
+  ],
+  "messageBubble": [
+    "[data-message-role]",
+    ".composer-message",
+    "[class*='markdown-body']",
+    "[class*='bubble']"
+  ],
+  "confirmationDialog": [
+    "[role='dialog']",
+    ".monaco-dialog-box",
+    "[class*='confirmation']",
+    "[class*='modal']"
+  ],
+  "confirmationButtons": [
+    "[role='dialog'] button",
+    ".monaco-dialog-box button"
+  ]
+}

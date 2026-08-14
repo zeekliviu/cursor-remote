@@ -1,0 +1,28 @@
+{
+  "name": "cursor-remote",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "packages/shared",
+    "packages/daemon",
+    "packages/mobile"
+  ],
+  "scripts": {
+    "setup": "node ./scripts/setup.mjs",
+    "doctor": "node ./scripts/doctor.mjs",
+    "build": "npm run build -w @cursor-remote/shared && npm run build -w @cursor-remote/daemon",
+    "cursor": "node ./scripts/launch-cursor.mjs",
+    "daemon": "npm run start -w @cursor-remote/daemon",
+    "daemon:start": "node ./scripts/run-daemon.mjs",
+    "daemon:dev": "npm run dev -w @cursor-remote/daemon",
+    "mobile": "npm run start -w @cursor-remote/mobile -- --clear",
+    "mobile:start": "npm run start -w @cursor-remote/mobile --"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "overrides": {
+    "react": "19.1.0",
+    "react-native": "0.81.4"
+  }
+}

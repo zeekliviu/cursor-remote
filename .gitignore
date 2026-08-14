@@ -1,0 +1,31 @@
+node_modules/
+dist/
+.expo/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+*.tsbuildinfo
+.turbo/
+
+# Local daemon / pairing secrets (never commit)
+packages/daemon/data/
+**/.cursor-remote/
+auth.json
+**/uploads/
+
+# Native / Expo leftovers
+*.jks
+*.p8
+*.p12
+*.mobileprovision
+*.orig.*
+web-build/
+android/
+ios/
+
+# Editor
+.idea/
+.vscode/
+*.swp

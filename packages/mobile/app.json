@@ -1,0 +1,47 @@
+{
+  "expo": {
+    "name": "Cursor Remote",
+    "slug": "cursor-remote",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "cursor-remote",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "plugins": [
+      "expo-router",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Scan the pairing QR from the daemon host."
+        }
+      ]
+    ],
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.cursorremote.app",
+      "infoPlist": {
+        "NSLocalNetworkUsageDescription": "Connect to your Cursor Remote daemon on the local network or VPN.",
+        "NSPhotoLibraryUsageDescription": "Attach photos to Cursor Composer messages.",
+        "NSCameraUsageDescription": "Optionally capture photos to send to Cursor.",
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true
+        }
+      }
+    },
+    "android": {
+      "softwareKeyboardLayoutMode": "pan",
+      "package": "com.cursorremote.app",
+      "permissions": [
+        "CAMERA",
+        "INTERNET",
+        "ACCESS_NETWORK_STATE",
+        "READ_MEDIA_IMAGES",
+        "READ_EXTERNAL_STORAGE"
+      ]
+    },
+    "experiments": {
+      "typedRoutes": true,
+      "autolinkingModuleResolution": true
+    }
+  }
+}

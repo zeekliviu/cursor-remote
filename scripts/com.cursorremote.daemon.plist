@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <key>Label</key>
+    <string>com.cursorremote.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+      <string>/bin/bash</string>
+      <string>REPLACE_WITH_REPO_PATH/scripts/run-daemon-service.sh</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/cursor-remote-daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/cursor-remote-daemon.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+      <key>PORT</key>
+      <string>7843</string>
+      <key>BIND_HOST</key>
+      <string>0.0.0.0</string>
+      <key>CDP_URL</key>
+      <string>http://127.0.0.1:9222</string>
+    </dict>
+  </dict>
+</plist>
