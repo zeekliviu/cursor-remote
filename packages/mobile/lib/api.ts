@@ -234,6 +234,11 @@ export class ApiClient {
     );
   }
 
+  /** Authenticated URL for Image components (token in query — RN Image has no headers). */
+  mediaUrl(filePath: string): string {
+    return `${this.baseUrl()}/media?path=${encodeURIComponent(filePath)}&token=${encodeURIComponent(this.conn.token)}`;
+  }
+
   diff(projectId: string) {
     return this.request<DiffResponse>(
       `/projects/${encodeURIComponent(projectId)}/diff`,
@@ -249,20 +254,75 @@ export class ApiClient {
       status?: string;
       labels: string[];
       currentModel?: string;
+      running?: boolean;
     }>("/composer/activity");
   }
 
-  selectComposer(body: { targetId?: string; chatName?: string }) {
-    return this.request<{ window: unknown }>("/composer/select", {
+  selectComposer(body: {
+    targetId?: string;
+    chatId?: string;
+    chatName?: string;
+    projectId?: string;
+    projectPath?: string;
+    projectName?: string;
+  }) {
+    return this.request<{
+      window: unknown;
+      chatSelected?: boolean;
+      repoSelected?: boolean;
+      matchedBy?: string;
+    }>("/composer/select", {
       method: "POST",
       body: JSON.stringify(body),
     });
   }
 
-  sendComposer(text: string, submit = true, attachmentPaths: string[] = []) {
+  newChat(projectId?: string) {
+    return this.request<{
+      ok: boolean;
+      method: string;
+      window?: unknown;
+    }>("/composer/new-chat", {
+      method: "POST",
+      body: JSON.stringify({ projectId }),
+    });
+  }
+
+  stopComposer() {
+    return this.request<{ ok: boolean }>("/composer/stop", {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+  }
+
+  openProject(projectId: string) {
+    return this.request<{
+      ok: boolean;
+      message: string;
+      window?: unknown;
+      matchedBy?: string;
+    }>(`/projects/${encodeURIComponent(projectId)}/open`, {
+      method: "POST",
+      body: JSON.stringify({}),
+    });
+  }
+
+  sendComposer(
+    text: string,
+    submit = true,
+    attachmentPaths: string[] = [],
+    opts?: { projectId?: string; chatName?: string; chatId?: string },
+  ) {
     return this.request<{ ok: boolean }>("/composer/send", {
       method: "POST",
-      body: JSON.stringify({ text, submit, attachmentPaths }),
+      body: JSON.stringify({
+        text,
+        submit,
+        attachmentPaths,
+        projectId: opts?.projectId,
+        chatName: opts?.chatName,
+        chatId: opts?.chatId,
+      }),
     });
   }
 
@@ -316,9 +376,19 @@ export class ApiClient {
   }
 
   confirmations() {
-    return this.request<{ items: Array<{ id: string; text: string; actions: Array<{ id: string; label: string }> }> }>(
-      "/composer/confirmations",
-    );
+    return this.request<{
+      items: Array<{
+        id: string;
+        text: string;
+        summary?: string;
+        command?: string;
+        actions: Array<{
+          id: string;
+          label: string;
+          risk: "low" | "medium" | "high";
+        }>;
+      }>;
+    }>("/composer/confirmations");
   }
 
   actConfirmation(confirmationId: string, actionId: string) {

@@ -1,26 +1,38 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   ActivityIndicator,
   Alert,
+  Animated,
   Image,
   Keyboard,
   KeyboardAvoidingView,
-  Modal,
+  type NativeScrollEvent,
+  type NativeSyntheticEvent,
   Platform,
   Pressable,
   ScrollView,
   StyleSheet,
-  Switch,
   Text,
   TextInput,
   View,
+  Linking,
 } from "react-native";
-import { useLocalSearchParams } from "expo-router";
+import { useFocusEffect, useLocalSearchParams, useNavigation, router } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import Markdown from "react-native-markdown-display";
 import * as ImagePicker from "expo-image-picker";
 import * as DocumentPicker from "expo-document-picker";
 import * as FileSystem from "expo-file-system/legacy";
+import * as Clipboard from "expo-clipboard";
+import * as Haptics from "expo-haptics";
 import type {
   AttachmentMeta,
   ChatChangedFile,
@@ -28,12 +40,20 @@ import type {
   ChatMessage,
   ComposerHealth,
   Confirmation,
-  ModelChoice,
-  ModelParamSection,
-  ModelParams,
 } from "@cursor-remote/shared";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useConnection } from "../../lib/connection";
+import { useComposerWatch } from "../../lib/composer-watch";
+import {
+  ModelPickerSheet,
+  shortModelLabel,
+} from "../../lib/model-picker-sheet";
+import {
+  clearFocusedChat,
+  isFocusedChat,
+  rememberChat,
+  setFocusedChat,
+} from "../../lib/focused-chat";
 import {
   buildChatBlocks,
 } from "../../lib/chat-blocks";
@@ -43,8 +63,39 @@ import {
   renderDiffLines,
 } from "../../lib/format-tool";
 
-const UI_BUILD = "ui-0814m";
 const DRAFT_KEY = (chatId: string) => `cursor-remote:draft:${chatId}`;
+/** How close to the bottom still counts as "following the conversation". */
+const NEAR_BOTTOM_PX = 80;
+const UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Cursor / agent transcripts sometimes contain markdown links whose "URL" is a
+ * bare composer/chat id (e.g. `[subagent](uuid)`). Open those in-app; never
+ * hand bare ids to Android Linking.
+ */
+function openSafeMarkdownUrl(
+  url: string,
+  opts?: { projectId?: string },
+): boolean {
+  const trimmed = (url || "").trim();
+  if (!trimmed) return false;
+  if (UUID_RE.test(trimmed)) {
+    const q = opts?.projectId
+      ? `?projectId=${encodeURIComponent(opts.projectId)}`
+      : "";
+    router.push(`/chats/${trimmed}${q}`);
+    return false;
+  }
+  if (
+    /^(https?:|mailto:|tel:|cursor-remote:)/i.test(trimmed) ||
+    trimmed.startsWith("/")
+  ) {
+    void Linking.openURL(trimmed).catch(() => undefined);
+    return false;
+  }
+  return false;
+}
 
 type LocalAttach = {
   uri: string;
@@ -53,12 +104,42 @@ type LocalAttach = {
   preview?: string;
 };
 
+function MessageImages({
+  images,
+  mediaUrl,
+}: {
+  images?: Array<{ path: string; name?: string; width?: number; height?: number }>;
+  mediaUrl: (path: string) => string;
+}) {
+  if (!images?.length) return null;
+  return (
+    <ScrollView
+      horizontal
+      style={styles.msgImageRow}
+      contentContainerStyle={styles.msgImageRowContent}
+      showsHorizontalScrollIndicator={false}
+    >
+      {images.map((img) => (
+        <Image
+          key={img.path}
+          source={{ uri: mediaUrl(img.path) }}
+          style={styles.msgImage}
+          resizeMode="cover"
+          accessibilityLabel={img.name || "Attachment"}
+        />
+      ))}
+    </ScrollView>
+  );
+}
+
 function TypewriterText({
   text,
   active,
+  onLinkPress,
 }: {
   text: string;
   active: boolean;
+  onLinkPress?: (url: string) => boolean;
 }) {
   const [shown, setShown] = useState(active ? "" : text);
   useEffect(() => {
@@ -76,7 +157,102 @@ function TypewriterText({
     }, 16);
     return () => clearInterval(id);
   }, [text, active]);
-  return <Markdown style={markdownStyles}>{shown || " "}</Markdown>;
+  return (
+    <Markdown style={markdownStyles} onLinkPress={onLinkPress}>
+      {shown || " "}
+    </Markdown>
+  );
+}
+
+/**
+ * Pulsing activity label — used in the nav subtitle next to the message count.
+ */
+function LiveStatusLine({
+  status,
+  compact,
+}: {
+  status: string | null;
+  compact?: boolean;
+}) {
+  const pulse = useRef(new Animated.Value(1)).current;
+  const running = Boolean(status);
+
+  useEffect(() => {
+    if (!running) {
+      pulse.setValue(1);
+      return;
+    }
+    const loop = Animated.loop(
+      Animated.sequence([
+        Animated.timing(pulse, {
+          toValue: 0.4,
+          duration: 760,
+          useNativeDriver: true,
+        }),
+        Animated.timing(pulse, {
+          toValue: 1,
+          duration: 760,
+          useNativeDriver: true,
+        }),
+      ]),
+    );
+    loop.start();
+    return () => {
+      loop.stop();
+      pulse.setValue(1);
+    };
+  }, [pulse, running]);
+
+  if (!status) return null;
+
+  return (
+    <Animated.View
+      style={[styles.statusLine, compact && styles.statusLineCompact, { opacity: pulse }]}
+    >
+      <View style={[styles.statusDot, compact && styles.statusDotCompact]} />
+      <Text style={[styles.statusText, compact && styles.statusTextCompact]}>
+        {status}
+      </Text>
+    </Animated.View>
+  );
+}
+
+/** Fade + lift used for approval cards so they never pop in abruptly. */
+function SoftEnter({
+  children,
+  style,
+}: {
+  children: ReactNode;
+  style?: object;
+}) {
+  const anim = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    Animated.timing(anim, {
+      toValue: 1,
+      duration: 220,
+      useNativeDriver: true,
+    }).start();
+  }, [anim]);
+  return (
+    <Animated.View
+      style={[
+        style,
+        {
+          opacity: anim,
+          transform: [
+            {
+              translateY: anim.interpolate({
+                inputRange: [0, 1],
+                outputRange: [10, 0],
+              }),
+            },
+          ],
+        },
+      ]}
+    >
+      {children}
+    </Animated.View>
+  );
 }
 
 export default function ChatScreen() {
@@ -85,12 +261,27 @@ export default function ChatScreen() {
     projectId?: string;
   }>();
   const { client } = useConnection();
+  const { toast } = useComposerWatch();
+  const navigation = useNavigation();
   const insets = useSafeAreaInsets();
   const scrollRef = useRef<ScrollView>(null);
   const lastLenRef = useRef(0);
   const streamingIdRef = useRef<string | null>(null);
+  const nearBottomRef = useRef(true);
+  const projectIdParam = typeof projectId === "string" ? projectId : undefined;
+
+  const onMarkdownLink = useCallback(
+    (url: string) => openSafeMarkdownUrl(url, { projectId: projectIdParam }),
+    [projectIdParam],
+  );
+
+  const mediaUrlFor = useCallback(
+    (filePath: string) => (client ? client.mediaUrl(filePath) : ""),
+    [client],
+  );
 
   const [chat, setChat] = useState<ChatDetail | null>(null);
+  const [projectName, setProjectName] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [live, setLive] = useState("");
@@ -113,25 +304,29 @@ export default function ChatScreen() {
   const [loadingChanged, setLoadingChanged] = useState<string | null>(null);
   const [agentStatus, setAgentStatus] = useState<string | null>(null);
   const [hostModelLabel, setHostModelLabel] = useState<string | null>(null);
-  const lastHostModelRef = useRef<string | null>(null);
   const [modelOpen, setModelOpen] = useState(false);
-  const [models, setModels] = useState<ModelChoice[]>([]);
-  const [modelParams, setModelParams] = useState<ModelParams | null>(null);
-  const [paramsLoading, setParamsLoading] = useState(false);
-  const [modelsLoading, setModelsLoading] = useState(false);
-  const [modelsError, setModelsError] = useState<string | null>(null);
-  const [selectedModel, setSelectedModel] = useState<ModelChoice | null>(null);
-  const [paramChoices, setParamChoices] = useState<Record<string, string>>({});
-  const [paramToggles, setParamToggles] = useState<Record<string, boolean>>({});
   const [kbHeight, setKbHeight] = useState(0);
   const [attaches, setAttaches] = useState<LocalAttach[]>([]);
   const [streamingIds, setStreamingIds] = useState<Record<string, boolean>>({});
+  const [bindHint, setBindHint] = useState<string | null>(null);
+  const [atBottom, setAtBottom] = useState(true);
+  const [newCount, setNewCount] = useState(0);
 
   const blocks = useMemo(
     () => (chat ? buildChatBlocks(chat.messages) : []),
     [chat],
   );
   const cdpOk = Boolean(health?.cdpReachable);
+  const agentRunning = Boolean(agentStatus) || busy;
+  const messageable = chat?.messageable !== false;
+  const showFilesChanged = Boolean(chat?.filesChanged?.length);
+
+  const canSend =
+    cdpOk &&
+    messageable &&
+    !agentRunning &&
+    (draft.trim().length > 0 || attaches.length > 0);
+  const showJumpPill = !atBottom && (newCount > 0 || agentRunning);
 
   const scrollBottom = useCallback(() => {
     requestAnimationFrame(() =>
@@ -139,7 +334,38 @@ export default function ChatScreen() {
     );
   }, []);
 
+  /** Auto-scroll only while the user is actually following the tail. */
+  const followBottom = useCallback(() => {
+    if (!nearBottomRef.current) return;
+    scrollBottom();
+  }, [scrollBottom]);
+
+  const jumpToLatest = useCallback(() => {
+    nearBottomRef.current = true;
+    setAtBottom(true);
+    setNewCount(0);
+    scrollBottom();
+  }, [scrollBottom]);
+
+  const onScroll = useCallback(
+    (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+      const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
+      const distance =
+        contentSize.height - contentOffset.y - layoutMeasurement.height;
+      const near = distance < NEAR_BOTTOM_PX;
+      nearBottomRef.current = near;
+      setAtBottom((prev) => (prev === near ? prev : near));
+      if (near) setNewCount((c) => (c === 0 ? c : 0));
+    },
+    [],
+  );
+
   const applyChatUpdate = useCallback((detail: ChatDetail) => {
+    // Counted outside the updater so a re-invoked updater can't double-count.
+    const grew = detail.messages.length - lastLenRef.current;
+    if (grew > 0 && lastLenRef.current > 0 && !nearBottomRef.current) {
+      setNewCount((c) => c + grew);
+    }
     setChat((prev) => {
       const prevLen = prev?.messages.length ?? 0;
       const nextLen = detail.messages.length;
@@ -156,7 +382,7 @@ export default function ChatScreen() {
             });
           }, Math.min(4000, newest.text.length * 8));
         }
-        setTimeout(scrollBottom, 50);
+        setTimeout(followBottom, 50);
       } else if (prev && nextLen === prevLen && nextLen > 0) {
         const a = prev.messages[prevLen - 1];
         const b = detail.messages[nextLen - 1];
@@ -169,29 +395,36 @@ export default function ChatScreen() {
         ) {
           streamingIdRef.current = b.id;
           setStreamingIds((s) => ({ ...s, [b.id]: true }));
-          setTimeout(scrollBottom, 30);
+          setTimeout(followBottom, 30);
         }
       }
       lastLenRef.current = nextLen;
       return detail;
     });
-  }, [scrollBottom]);
+  }, [followBottom]);
 
   const refresh = useCallback(async (quiet = false) => {
     if (!client || !id) return;
     if (!quiet) setError(null);
     try {
-      const [detail, h, activity] = await Promise.all([
+      const [detail, h, activity, conf] = await Promise.all([
         client.chat(id),
         client.composerHealth().catch(() => null),
         client.composerActivity().catch(() => null),
+        client.confirmations().catch(() => ({ items: [] as Confirmation[] })),
       ]);
       applyChatUpdate(detail);
       setHealth(h);
-      setAgentStatus(activity?.status || null);
+      setAgentStatus(
+        activity?.running === false
+          ? null
+          : activity?.status ||
+              (activity?.running ? "Working…" : null),
+      );
       if (activity?.currentModel) {
         setHostModelLabel(activity.currentModel);
       }
+      setConfirmations(conf.items as Confirmation[]);
     } catch (err) {
       if (!quiet) setError((err as Error).message);
     }
@@ -200,6 +433,75 @@ export default function ChatScreen() {
   useEffect(() => {
     refresh(false);
   }, [refresh]);
+
+  useEffect(() => {
+    if (!client || !projectId) {
+      setProjectName(null);
+      return;
+    }
+    let cancelled = false;
+    client
+      .projects()
+      .then(({ projects }) => {
+        if (cancelled) return;
+        const p = projects.find((x) => x.id === projectId);
+        setProjectName(p?.name || null);
+      })
+      .catch(() => {
+        if (!cancelled) setProjectName(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [client, projectId]);
+
+  // The header carries identity + live agent status next to the message count.
+  const headerSubtitle = useMemo(() => {
+    const parts = [
+      projectName,
+      messageable ? null : "view only",
+      chat?.messages.length ? `${chat.messages.length} msg` : null,
+    ].filter(Boolean);
+    return parts.length ? parts.join(" · ") : null;
+  }, [projectName, messageable, chat?.messages.length]);
+
+  const headerStatus = agentStatus || (busy ? live || "Working…" : null);
+
+  useLayoutEffect(() => {
+    navigation.setOptions({
+      headerTitle: () => (
+        <View style={styles.headerTitleWrap}>
+          <Text style={styles.headerTitle} numberOfLines={1}>
+            {chat?.name || "Chat"}
+          </Text>
+          {headerSubtitle ? (
+            <Text style={styles.headerSubtitle} numberOfLines={1}>
+              {headerSubtitle}
+            </Text>
+          ) : null}
+          {headerStatus ? (
+            <LiveStatusLine status={headerStatus} compact />
+          ) : null}
+        </View>
+      ),
+    });
+  }, [navigation, headerSubtitle, headerStatus, chat?.name]);
+
+  // Let the background watcher know this chat is on screen (no notification needed).
+  useFocusEffect(
+    useCallback(() => {
+      if (!id) return;
+      setFocusedChat({ id, projectId: projectIdParam });
+      return () => clearFocusedChat(id);
+    }, [id, projectIdParam]),
+  );
+
+  useEffect(() => {
+    if (!id || !chat?.name) return;
+    const ref = { id, projectId: projectIdParam, name: chat.name };
+    if (isFocusedChat(id)) setFocusedChat(ref);
+    else rememberChat(ref);
+  }, [id, projectIdParam, chat?.name]);
 
   useEffect(() => {
     const showEvt =
@@ -248,133 +550,46 @@ export default function ChatScreen() {
 
   useEffect(() => {
     if (!client || !chat?.name) return;
-    client.selectComposer({ chatName: chat.name }).catch(() => undefined);
-  }, [client, chat?.name]);
-
-  const applyParamsState = useCallback((params: ModelParams | null) => {
-    setModelParams(params);
-    const choices: Record<string, string> = {};
-    const toggles: Record<string, boolean> = {};
-    for (const section of params?.sections || []) {
-      if (section.kind === "choice") {
-        const sel = section.options.find((o) => o.selected);
-        if (sel) choices[section.title] = sel.label;
-      } else {
-        for (const o of section.options) {
-          toggles[o.label] = o.selected;
-        }
-      }
-    }
-    setParamChoices(choices);
-    setParamToggles(toggles);
-  }, []);
-
-  const loadParamsForModel = useCallback(
-    async (label: string) => {
-      if (!client) return;
-      setParamsLoading(true);
-      try {
-        const p = await client.modelParams(label);
-        applyParamsState({
-          modelLabel: p.modelLabel || label,
-          baseModel: p.baseModel,
-          sections: p.sections || [],
-        });
-      } catch (err) {
-        setModelsError((err as Error).message);
-        applyParamsState({ modelLabel: label, sections: [] });
-      } finally {
-        setParamsLoading(false);
-      }
-    },
-    [applyParamsState, client],
-  );
-
-  const loadModelsFromCdp = useCallback(async () => {
-    if (!client) return;
-    setModelsLoading(true);
-    setModelsError(null);
-    try {
-      const r = await client.models();
-      if (!r.models?.length) {
-        setModels([]);
-        setModelsError(r.error || "No models from CDP scrape");
-        return;
-      }
-      setModels(r.models);
-      let chosen =
-        (r.current &&
-          r.models.find(
-            (m) =>
-              m.label === r.current ||
-              r.current?.toLowerCase().includes(m.label.toLowerCase()) ||
-              m.label.toLowerCase().includes((r.current || "").toLowerCase()),
-          )) ||
-        null;
-      if (!chosen) chosen = r.models[0];
-      setSelectedModel(chosen);
-      if (r.params?.sections) {
-        applyParamsState(r.params);
-      } else if (chosen) {
-        await loadParamsForModel(chosen.label);
-      }
-    } catch (err) {
-      setModels([]);
-      setModelsError((err as Error).message);
-    } finally {
-      setModelsLoading(false);
-    }
-  }, [applyParamsState, client, loadParamsForModel]);
-
-  // Sync Expo model label when host Cursor picker changes
-  useEffect(() => {
-    if (!hostModelLabel) return;
-    if (lastHostModelRef.current === hostModelLabel) return;
-    lastHostModelRef.current = hostModelLabel;
-    const label = hostModelLabel;
-    setSelectedModel((prev) => {
-      if (prev && prev.label === label) return prev;
-      const match = models.find(
-        (m) =>
-          m.label === label ||
-          label.toLowerCase().includes(m.label.toLowerCase()) ||
-          m.label.toLowerCase().includes(label.toLowerCase()),
-      );
-      return (
-        match || {
-          id: label.toLowerCase().replace(/\s+/g, "-"),
-          label,
-        }
-      );
-    });
-    if (modelOpen) {
-      loadParamsForModel(label).catch(() => undefined);
-    }
-  }, [hostModelLabel, loadParamsForModel, modelOpen, models]);
-
-  async function applyModelToCursor() {
-    if (!client || !selectedModel) return;
-    if (!cdpOk) {
-      Alert.alert("CDP down", "Cannot apply model without Cursor CDP.");
-      return;
-    }
-    try {
-      const { ok } = await client.selectModel(
-        selectedModel.label,
-        undefined,
-        undefined,
-        { choices: paramChoices, toggles: paramToggles },
-      );
-      if (!ok) {
-        Alert.alert(
-          "Model",
-          `Could not apply "${selectedModel.label}" in Cursor UI — retune selectors.`,
-        );
-      }
-    } catch (err) {
-      Alert.alert("Model", (err as Error).message);
-    }
-  }
+    let cancelled = false;
+    client
+      .selectComposer({
+        chatId: typeof id === "string" ? id : undefined,
+        chatName: chat.name,
+        projectId: typeof projectId === "string" ? projectId : undefined,
+      })
+      .then((r) => {
+        if (cancelled) return;
+        const title =
+          r.window &&
+          typeof r.window === "object" &&
+          "title" in r.window &&
+          typeof (r.window as { title?: string }).title === "string"
+            ? (r.window as { title: string }).title
+            : null;
+        const parts = [
+          r.matchedBy === "agentsPanel"
+            ? "selected in Agents panel"
+            : r.matchedBy === "project"
+              ? "bound to project window"
+              : r.matchedBy === "fallback"
+                ? "Agents panel bind failed — open Agents sidebar"
+                : null,
+          r.matchedBy === "agentsPanel" && r.chatSelected === false
+            ? "chat not found under repo"
+            : null,
+          title && r.matchedBy !== "fallback"
+            ? `· ${title.slice(0, 48)}`
+            : null,
+        ].filter(Boolean);
+        setBindHint(parts.length ? parts.join(" ") : null);
+      })
+      .catch((err) => {
+        if (!cancelled) setBindHint((err as Error).message);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [client, chat?.name, projectId, id]);
 
   async function pickPhoto() {
     const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -399,6 +614,28 @@ export default function ChatScreen() {
     ]);
   }
 
+  async function takePhoto() {
+    const perm = await ImagePicker.requestCameraPermissionsAsync();
+    if (!perm.granted) {
+      Alert.alert("Camera", "Permission required");
+      return;
+    }
+    const res = await ImagePicker.launchCameraAsync({
+      quality: 0.55,
+    });
+    if (res.canceled || !res.assets?.[0]) return;
+    const a = res.assets[0];
+    setAttaches((prev) => [
+      ...prev,
+      {
+        uri: a.uri,
+        name: a.fileName || `camera-${Date.now()}.jpg`,
+        mime: a.mimeType || "image/jpeg",
+        preview: a.uri,
+      },
+    ]);
+  }
+
   async function pickDoc() {
     const res = await DocumentPicker.getDocumentAsync({
       copyToCacheDirectory: true,
@@ -413,6 +650,61 @@ export default function ChatScreen() {
         mime: a.mimeType || "application/octet-stream",
       })),
     ]);
+  }
+
+  function openAttachMenu() {
+    Alert.alert("Attach", "Add to your next message", [
+      { text: "Photo library", onPress: () => void pickPhoto() },
+      { text: "Take photo", onPress: () => void takePhoto() },
+      { text: "Files", onPress: () => void pickDoc() },
+      { text: "Cancel", style: "cancel" },
+    ]);
+  }
+
+  function copyOrQuote(m: ChatMessage) {
+    const text = (m.text || "").trim();
+    if (!text) return;
+    void Haptics.selectionAsync().catch(() => undefined);
+    Alert.alert(
+      m.role === "user" ? "Your message" : "Assistant message",
+      text.length > 140 ? `${text.slice(0, 140)}…` : text,
+      [
+        {
+          text: "Copy",
+          onPress: () => {
+            Clipboard.setStringAsync(text)
+              .then(() => toast("Copied"))
+              .catch(() => undefined);
+          },
+        },
+        {
+          text: "Quote in reply",
+          onPress: () => {
+            const quoted = text
+              .split("\n")
+              .slice(0, 12)
+              .map((line) => `> ${line}`)
+              .join("\n");
+            setDraft((d) =>
+              d.trim() ? `${quoted}\n\n${d}` : `${quoted}\n\n`,
+            );
+          },
+        },
+        { text: "Cancel", style: "cancel" },
+      ],
+    );
+  }
+
+  async function stopAgent() {
+    if (!client) return;
+    try {
+      setLive("Stopping…");
+      await client.stopComposer();
+      setLive("Stop sent");
+      await refresh(true);
+    } catch (err) {
+      Alert.alert("Stop", (err as Error).message);
+    }
   }
 
   async function uploadAll(): Promise<AttachmentMeta[]> {
@@ -431,6 +723,13 @@ export default function ChatScreen() {
 
   async function send() {
     if (!client) return;
+    if (!messageable) {
+      Alert.alert(
+        "View only",
+        "This transcript has no Composer input. Open a parent agent chat to send.",
+      );
+      return;
+    }
     if (!draft.trim() && attaches.length === 0) return;
     if (!cdpOk) {
       Alert.alert(
@@ -456,6 +755,11 @@ export default function ChatScreen() {
         text,
         true,
         uploaded.map((u) => u.path),
+        {
+          projectId: typeof projectId === "string" ? projectId : undefined,
+          chatName: chat?.name,
+          chatId: typeof id === "string" ? id : undefined,
+        },
       );
       setLive("Sent");
       setDraft("");
@@ -499,15 +803,20 @@ export default function ChatScreen() {
       <ScrollView
         ref={scrollRef}
         contentContainerStyle={styles.container}
-        onContentSizeChange={scrollBottom}
+        onContentSizeChange={followBottom}
+        onScroll={onScroll}
+        scrollEventThrottle={16}
         keyboardShouldPersistTaps="handled"
       >
-        <Text style={styles.title}>{chat.name}</Text>
-        <Text style={styles.meta}>
-          {chat.mode} · {chat.messages.length} messages
-          {projectId ? ` · ${projectId.slice(0, 8)}` : ""} · {UI_BUILD}
-          {cdpOk ? " · live" : ""}
-        </Text>
+        {!messageable ? (
+          <View style={styles.readonlyBanner}>
+            <Text style={styles.readonlyTitle}>View only</Text>
+            <Text style={styles.readonlyBody}>
+              This is a subagent / explore transcript. Cursor has no Composer
+              input here — open a parent agent chat to send messages.
+            </Text>
+          </View>
+        ) : null}
         {!cdpOk ? (
           <View style={styles.warn}>
             <Text style={styles.warnTitle}>CDP down — Send is blocked</Text>
@@ -519,29 +828,7 @@ export default function ChatScreen() {
         ) : null}
         {error ? <Text style={styles.error}>{error}</Text> : null}
         {live ? <Text style={styles.live}>{live}</Text> : null}
-        {agentStatus ? (
-          <Text style={styles.agentStatus}>{agentStatus}</Text>
-        ) : null}
-        {confirmations.map((c) => (
-          <View key={c.id} style={styles.confirm}>
-            <Text style={styles.confirmText}>{c.text}</Text>
-            <View style={styles.row}>
-              {c.actions.map((a) => (
-                <Pressable
-                  key={a.id}
-                  style={styles.chip}
-                  onPress={async () => {
-                    await client.actConfirmation(c.id, a.id);
-                    setConfirmations([]);
-                    refresh(true);
-                  }}
-                >
-                  <Text style={styles.chipText}>{a.label}</Text>
-                </Pressable>
-              ))}
-            </View>
-          </View>
-        ))}
+        {bindHint ? <Text style={styles.bindHint}>{bindHint}</Text> : null}
         {blocks.map((block) => {
           if (block.kind === "thinking") {
             const m = block.message;
@@ -683,25 +970,42 @@ export default function ChatScreen() {
             );
           }
           return (
-            <View
+            <Pressable
               key={m.id}
-              style={[
+              onLongPress={() => copyOrQuote(m)}
+              delayLongPress={280}
+              style={({ pressed }) => [
                 styles.bubble,
                 m.role === "user" ? styles.user : styles.assistant,
+                pressed && styles.bubblePressed,
               ]}
             >
               <Text style={styles.role}>{m.role}</Text>
+              <MessageImages images={m.images} mediaUrl={mediaUrlFor} />
               {m.role === "assistant" ? (
-                <TypewriterText text={m.text || " "} active={animate} />
+                m.text ? (
+                  <TypewriterText
+                    text={m.text}
+                    active={animate}
+                    onLinkPress={onMarkdownLink}
+                  />
+                ) : null
               ) : m.role === "user" ? (
-                <Markdown style={markdownStyles}>{m.text || " "}</Markdown>
+                m.text ? (
+                  <Markdown
+                    style={markdownStyles}
+                    onLinkPress={onMarkdownLink}
+                  >
+                    {m.text}
+                  </Markdown>
+                ) : null
               ) : (
                 <Text style={styles.bubbleText}>{m.text}</Text>
               )}
-            </View>
+            </Pressable>
           );
         })}
-        {(chat.filesChanged?.length || 0) > 0 ? (
+        {(showFilesChanged && (chat.filesChanged?.length || 0) > 0) ? (
           <View style={styles.filesChanged}>
             <Pressable
               onPress={() => setExpandedChanged((v) => !v)}
@@ -787,7 +1091,7 @@ export default function ChatScreen() {
               : null}
           </View>
         ) : null}
-        <View onLayout={scrollBottom} style={{ height: 1 }} />
+        <View onLayout={followBottom} style={{ height: 1 }} />
       </ScrollView>
 
       <View
@@ -806,39 +1110,137 @@ export default function ChatScreen() {
           },
         ]}
       >
-        <View style={styles.row}>
+        {showJumpPill ? (
           <Pressable
-            style={styles.modelBtn}
-            onPress={() => {
-              setModelOpen(true);
-              loadModelsFromCdp();
-            }}
+            onPress={jumpToLatest}
+            style={({ pressed }) => [
+              styles.jumpPill,
+              pressed && styles.pressedSoft,
+            ]}
+            accessibilityLabel="Scroll to latest message"
           >
-            <Text style={styles.modelBtnText} numberOfLines={1}>
-              {selectedModel
-                ? [
-                    selectedModel.label,
-                    ...Object.entries(paramChoices).map(
-                      ([, v]) => v,
-                    ),
-                    ...Object.entries(paramToggles)
-                      .filter(([, on]) => on)
-                      .map(([k]) => k),
-                  ]
-                    .filter(Boolean)
-                    .slice(0, 3)
-                    .join(" · ")
-                : "Model (CDP)"}
+            <Text style={styles.jumpPillText}>
+              {newCount > 0
+                ? `↓ ${newCount} new`
+                : "↓ Jump to latest"}
             </Text>
           </Pressable>
-          <Pressable style={styles.iconBtn} onPress={pickPhoto}>
-            <Text style={styles.iconBtnText}>Photo</Text>
-          </Pressable>
-          <Pressable style={styles.iconBtn} onPress={pickDoc}>
-            <Text style={styles.iconBtnText}>File</Text>
-          </Pressable>
-        </View>
-
+        ) : null}
+        {confirmations.length > 0 ? (
+          <View style={styles.confirmStack}>
+            {confirmations
+              .filter((c) => {
+                const t = (c.text || "")
+                  .replace(/[↵⏎]/g, "")
+                  .replace(/\s+/g, " ")
+                  .trim();
+                // Drop scrapes that are only button labels (legacy daemon / nested parents).
+                if (
+                  /^(skip|run|allow|cancel|reject|deny|yes|no)(\s+(skip|run|allow|cancel|reject|deny|yes|no))*$/i.test(
+                    t,
+                  )
+                ) {
+                  return false;
+                }
+                return t.length >= 4;
+              })
+              .map((c) => {
+              const runLike = c.actions.filter((a) =>
+                /^(run|allow|accept|approve|continue|confirm|yes)$/i.test(
+                  a.label,
+                ),
+              );
+              const cancelLike = c.actions.filter((a) =>
+                /^(cancel|skip|reject|deny|no)$/i.test(a.label),
+              );
+              const other = c.actions.filter(
+                (a) =>
+                  !runLike.some((x) => x.id === a.id) &&
+                  !cancelLike.some((x) => x.id === a.id),
+              );
+              const ordered = [...runLike, ...other, ...cancelLike];
+              return (
+                <SoftEnter key={c.id} style={styles.confirm}>
+                  <Text style={styles.confirmBadge}>Needs approval</Text>
+                  <Text style={styles.confirmTitle}>
+                    {c.text
+                      .replace(/[↵⏎]/g, "")
+                      .replace(
+                        /\s+(Skip|Run|Allow|Cancel|Reject|Deny)(\s+(Skip|Run|Allow|Cancel|Reject|Deny))*\s*$/i,
+                        "",
+                      )
+                      .trim()}
+                  </Text>
+                  {c.summary ? (
+                    <Text style={styles.confirmSummary} selectable>
+                      {c.summary}
+                    </Text>
+                  ) : null}
+                  {c.command ? (
+                    <View style={styles.confirmCommandBox}>
+                      <Text style={styles.confirmCommandLabel}>Command</Text>
+                      <Text style={styles.confirmCommand} selectable>
+                        {c.command}
+                      </Text>
+                    </View>
+                  ) : null}
+                  <View style={styles.confirmActions}>
+                    {ordered.map((a) => {
+                      const isRun =
+                        /^(run|allow|accept|approve|continue|confirm|yes)$/i.test(
+                          a.label,
+                        );
+                      const isCancel = /^(cancel|skip|reject|deny|no)$/i.test(
+                        a.label,
+                      );
+                      return (
+                        <Pressable
+                          key={a.id}
+                          style={({ pressed }) => [
+                            styles.confirmBtn,
+                            isRun && styles.confirmBtnRun,
+                            isCancel && styles.confirmBtnCancel,
+                            a.risk === "high" &&
+                              isRun &&
+                              styles.confirmBtnHigh,
+                            pressed && styles.pressedSoft,
+                          ]}
+                          onPress={async () => {
+                            void Haptics.selectionAsync().catch(
+                              () => undefined,
+                            );
+                            try {
+                              await client.actConfirmation(c.id, a.id);
+                              setConfirmations([]);
+                              refresh(true);
+                            } catch (err) {
+                              Alert.alert("Approval", (err as Error).message);
+                            }
+                          }}
+                        >
+                          <Text
+                            style={[
+                              styles.confirmBtnText,
+                              (isRun || isCancel) && styles.confirmBtnTextOn,
+                            ]}
+                          >
+                            {a.label}
+                          </Text>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+                </SoftEnter>
+              );
+            })}
+          </View>
+        ) : null}
+        {!messageable ? (
+          <Text style={styles.composerReadonlyHint}>
+            View only · no Composer input on this chat
+          </Text>
+        ) : (
+          <>
         {attaches.length ? (
           <ScrollView horizontal style={styles.attachRow}>
             {attaches.map((a, i) => (
@@ -861,156 +1263,82 @@ export default function ChatScreen() {
         ) : null}
 
         <View style={styles.inputRow}>
+          <Pressable
+            style={({ pressed }) => [
+              styles.attachBtn,
+              pressed && styles.attachBtnPressed,
+            ]}
+            onPress={openAttachMenu}
+            hitSlop={6}
+            accessibilityLabel="Attach file"
+          >
+            <Text style={styles.attachBtnIcon}>＋</Text>
+          </Pressable>
+          <Pressable
+            style={({ pressed }) => [
+              styles.modelChip,
+              pressed && styles.pressedSoft,
+            ]}
+            onPress={() => setModelOpen(true)}
+            accessibilityLabel="Change model"
+          >
+            <Text style={styles.modelChipText} numberOfLines={1}>
+              {shortModelLabel(hostModelLabel)}
+            </Text>
+          </Pressable>
           <TextInput
-            style={[styles.input, styles.multiline, { flex: 1 }]}
+            style={[styles.input, styles.multiline, styles.inputGrow]}
             placeholder={cdpOk ? "Message…" : "CDP down — cannot send"}
             multiline
             value={draft}
             onChangeText={setDraft}
-            editable={cdpOk && !busy}
+            editable={cdpOk && !agentRunning}
           />
           <Pressable
-            style={[styles.send, (!cdpOk || busy) && { opacity: 0.45 }]}
-            disabled={busy || !cdpOk}
-            onPress={send}
+            style={({ pressed }) => [
+              styles.actionOrb,
+              agentRunning && styles.actionOrbStop,
+              !agentRunning && !canSend && styles.actionOrbDisabled,
+              pressed && styles.actionOrbPressed,
+            ]}
+            disabled={!cdpOk || (!agentRunning && !canSend)}
+            onPress={() => {
+              void Haptics.impactAsync(
+                agentRunning
+                  ? Haptics.ImpactFeedbackStyle.Medium
+                  : Haptics.ImpactFeedbackStyle.Light,
+              ).catch(() => undefined);
+              if (agentRunning) void stopAgent();
+              else void send();
+            }}
+            accessibilityLabel={agentRunning ? "Stop agent" : "Send message"}
           >
-            <Text style={styles.sendText}>{busy ? "…" : "Send"}</Text>
+            <Text
+              style={[
+                styles.actionOrbIcon,
+                agentRunning && styles.actionOrbIconStop,
+                !agentRunning && !canSend && styles.actionOrbIconDisabled,
+              ]}
+            >
+              {agentRunning ? "■" : "✈"}
+            </Text>
           </Pressable>
         </View>
+          </>
+        )}
       </View>
 
-      <Modal visible={modelOpen} animationType="slide" transparent>
-        <View style={styles.modalBackdrop}>
-          <View
-            style={[
-              styles.modalSheet,
-              { paddingBottom: Math.max(insets.bottom, 20), maxHeight: "88%" },
-            ]}
-          >
-            <Text style={styles.modalTitle}>Model (live CDP)</Text>
-            {hostModelLabel ? (
-              <Text style={styles.hostSync}>Host: {hostModelLabel}</Text>
-            ) : null}
-            {modelsLoading ? (
-              <ActivityIndicator style={{ marginVertical: 16 }} />
-            ) : null}
-            {modelsError ? (
-              <Text style={styles.error}>{modelsError}</Text>
-            ) : null}
-
-            <Text style={[styles.modalTitle, { marginTop: 4 }]}>
-              {selectedModel?.label || "Select a model"}
-            </Text>
-            {paramsLoading ? (
-              <ActivityIndicator style={{ marginVertical: 8 }} />
-            ) : null}
-            {(modelParams?.sections || []).map(
-              (section: ModelParamSection) => (
-                <View key={section.id} style={{ marginTop: 10 }}>
-                  <Text style={styles.sectionLabel}>{section.title}</Text>
-                  {section.kind === "toggle" ? (
-                    <View style={{ gap: 8 }}>
-                      {section.options.map((opt) => {
-                        const on = !!paramToggles[opt.label];
-                        return (
-                          <View key={opt.id} style={styles.toggleRow}>
-                            <Text style={styles.modalItemText}>{opt.label}</Text>
-                            <Switch
-                              value={on}
-                              onValueChange={(v) =>
-                                setParamToggles((s) => ({
-                                  ...s,
-                                  [opt.label]: v,
-                                }))
-                              }
-                              trackColor={{ false: "#d5cfc2", true: "#2f5d3a" }}
-                              thumbColor="#f7f4ee"
-                            />
-                          </View>
-                        );
-                      })}
-                    </View>
-                  ) : (
-                    <View style={styles.rowWrap}>
-                      {section.options.map((opt) => {
-                        const on = paramChoices[section.title] === opt.label;
-                        return (
-                          <Pressable
-                            key={opt.id}
-                            style={[styles.effortChip, on && styles.modalItemOn]}
-                            onPress={() =>
-                              setParamChoices((s) => ({
-                                ...s,
-                                [section.title]: opt.label,
-                              }))
-                            }
-                          >
-                            <Text style={styles.modalItemText}>{opt.label}</Text>
-                          </Pressable>
-                        );
-                      })}
-                    </View>
-                  )}
-                </View>
-              ),
-            )}
-            {!paramsLoading &&
-            selectedModel &&
-            !/^auto$/i.test(selectedModel.label) &&
-            !(modelParams?.sections || []).length ? (
-              <Text style={[styles.meta, { marginTop: 8 }]}>
-                No extra options for this model in Cursor UI.
-              </Text>
-            ) : null}
-
-            <Text style={[styles.modalTitle, { marginTop: 14 }]}>
-              All models
-            </Text>
-            <ScrollView style={{ maxHeight: 180 }}>
-              {models.map((m) => (
-                <Pressable
-                  key={m.id}
-                  style={[
-                    styles.modalItem,
-                    selectedModel?.id === m.id && styles.modalItemOn,
-                  ]}
-                  onPress={async () => {
-                    setSelectedModel(m);
-                    await loadParamsForModel(m.label);
-                  }}
-                >
-                  <Text style={styles.modalItemText}>{m.label}</Text>
-                </Pressable>
-              ))}
-            </ScrollView>
-
-            <Pressable
-              style={{ paddingVertical: 10, alignItems: "center" }}
-              onPress={() => loadModelsFromCdp()}
-            >
-              <Text style={{ color: "#2f5d3a", fontWeight: "600" }}>
-                Rescrape menu
-              </Text>
-            </Pressable>
-            <Pressable
-              style={[styles.send, { marginTop: 8 }]}
-              onPress={async () => {
-                setModelOpen(false);
-                await applyModelToCursor();
-              }}
-              disabled={!selectedModel}
-            >
-              <Text style={styles.sendText}>Apply in Cursor</Text>
-            </Pressable>
-            <Pressable
-              style={{ paddingVertical: 12, alignItems: "center" }}
-              onPress={() => setModelOpen(false)}
-            >
-              <Text style={{ color: "#6f685c", fontWeight: "600" }}>Cancel</Text>
-            </Pressable>
-          </View>
-        </View>
-      </Modal>
+      <ModelPickerSheet
+        open={modelOpen}
+        hostModelLabel={hostModelLabel}
+        cdpOk={cdpOk}
+        onClose={() => setModelOpen(false)}
+        onApplied={(label) => {
+          // Show it straight away; the activity poll confirms within a tick.
+          setHostModelLabel(label);
+          setModelOpen(false);
+        }}
+      />
     </KeyboardAvoidingView>
   );
 }
@@ -1043,8 +1371,53 @@ const markdownStyles = StyleSheet.create({
 const styles = StyleSheet.create({
   flex: { flex: 1 },
   center: { flex: 1, alignItems: "center", justifyContent: "center" },
+  headerTitleWrap: {
+    alignItems: Platform.OS === "ios" ? "center" : "flex-start",
+    maxWidth: 320,
+  },
+  headerTitle: {
+    fontSize: 17,
+    fontWeight: "700",
+    color: "#1c1915",
+  },
+  headerSubtitle: {
+    fontSize: 12,
+    color: "#6f685c",
+    marginTop: 1,
+  },
+  statusLine: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    gap: 5,
+    marginTop: 2,
+    maxWidth: 320,
+  },
+  statusLineCompact: {},
+  statusDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: "#b8863b",
+    marginTop: 4,
+  },
+  statusDotCompact: {
+    width: 5,
+    height: 5,
+    borderRadius: 2.5,
+    marginTop: 4,
+  },
+  statusText: {
+    flex: 1,
+    color: "#6b5b3e",
+    fontSize: 12,
+    fontStyle: "italic",
+    fontWeight: "600",
+  },
+  statusTextCompact: {
+    fontSize: 11,
+    lineHeight: 14,
+  },
   container: { padding: 16, gap: 10, paddingBottom: 24 },
-  title: { fontSize: 22, fontWeight: "700", color: "#1c1915" },
   meta: { color: "#6f685c", marginBottom: 6 },
   bubble: {
     borderRadius: 14,
@@ -1052,8 +1425,28 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: "#e5dfd2",
   },
+  bubblePressed: { opacity: 0.72 },
+  msgImageRow: { marginBottom: 8, maxHeight: 168 },
+  msgImageRowContent: { gap: 8, paddingVertical: 2 },
+  msgImage: {
+    width: 148,
+    height: 148,
+    borderRadius: 10,
+    backgroundColor: "#ebe4d6",
+  },
   user: { backgroundColor: "#ebe4d6" },
   assistant: { backgroundColor: "#fffdf8" },
+  jumpPill: {
+    alignSelf: "center",
+    backgroundColor: "#f5e6d2",
+    borderWidth: 1,
+    borderColor: "#e0c9a0",
+    borderRadius: 999,
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+  },
+  jumpPillText: { color: "#8a5a20", fontSize: 13, fontWeight: "700" },
+  pressedSoft: { opacity: 0.7 },
   role: {
     fontSize: 11,
     fontWeight: "700",
@@ -1087,12 +1480,6 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 18,
     fontStyle: "italic",
-  },
-  agentStatus: {
-    color: "#6b5b3e",
-    fontSize: 13,
-    fontStyle: "italic",
-    marginBottom: 8,
   },
   toolHeader: { paddingHorizontal: 12, paddingVertical: 10 },
   toolHeaderText: { color: "#5c564c", fontWeight: "700", fontSize: 13 },
@@ -1140,18 +1527,8 @@ const styles = StyleSheet.create({
   },
   multiline: { minHeight: 44, maxHeight: 120, textAlignVertical: "top" },
   inputRow: { flexDirection: "row", gap: 8, alignItems: "flex-end" },
-  send: {
-    backgroundColor: "#1c1915",
-    borderRadius: 12,
-    paddingVertical: 12,
-    paddingHorizontal: 16,
-    alignItems: "center",
-    justifyContent: "center",
-    minHeight: 44,
-  },
-  sendText: { color: "#f7f4ee", fontWeight: "700" },
+  inputGrow: { flex: 1, minWidth: 0 },
   row: { flexDirection: "row", gap: 8, alignItems: "center" },
-  rowWrap: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
   chip: {
     backgroundColor: "#1c1915",
     paddingHorizontal: 12,
@@ -1159,23 +1536,79 @@ const styles = StyleSheet.create({
     borderRadius: 10,
   },
   chipText: { color: "#f7f4ee", fontWeight: "600", fontSize: 13 },
-  modelBtn: {
-    flex: 1,
+  modelChip: {
+    maxWidth: 88,
+    height: 42,
+    paddingHorizontal: 10,
+    borderRadius: 21,
     backgroundColor: "#fffdf8",
     borderWidth: 1,
     borderColor: "#e5dfd2",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  modelChipText: {
+    color: "#1c1915",
+    fontWeight: "700",
+    fontSize: 12,
+  },
+  attachBtn: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: "#ebe4d6",
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  attachBtnPressed: { backgroundColor: "#ded6c6" },
+  attachBtnIcon: {
+    color: "#1c1915",
+    fontSize: 22,
+    fontWeight: "500",
+    marginTop: -1,
+  },
+  stopBtn: {
+    backgroundColor: "#8a4030",
     borderRadius: 10,
     paddingHorizontal: 12,
     paddingVertical: 10,
   },
-  modelBtnText: { color: "#1c1915", fontWeight: "600" },
-  iconBtn: {
-    backgroundColor: "#ebe4d6",
-    borderRadius: 10,
-    paddingHorizontal: 10,
-    paddingVertical: 10,
+  stopBtnText: { color: "#f7f4ee", fontWeight: "700", fontSize: 13 },
+  actionOrb: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    backgroundColor: "#1c1915",
+    alignItems: "center",
+    justifyContent: "center",
   },
-  iconBtnText: { color: "#1c1915", fontWeight: "600", fontSize: 13 },
+  actionOrbStop: {
+    backgroundColor: "#8a4030",
+  },
+  actionOrbDisabled: {
+    backgroundColor: "#d5cfc2",
+  },
+  actionOrbPressed: {
+    opacity: 0.75,
+    transform: [{ scale: 0.94 }],
+  },
+  actionOrbIcon: {
+    color: "#f7f4ee",
+    fontSize: 18,
+    fontWeight: "700",
+    marginTop: -1,
+  },
+  actionOrbIconStop: {
+    fontSize: 14,
+  },
+  actionOrbIconDisabled: {
+    color: "#9a9488",
+  },
+  bindHint: {
+    color: "#8a8378",
+    fontSize: 12,
+    marginBottom: 4,
+  },
   attachRow: { maxHeight: 64 },
   attachChip: {
     flexDirection: "row",
@@ -1190,13 +1623,68 @@ const styles = StyleSheet.create({
   },
   thumb: { width: 28, height: 28, borderRadius: 6 },
   attachName: { color: "#1c1915", fontSize: 12, flexShrink: 1 },
+  confirmStack: { gap: 8, marginBottom: 8 },
   confirm: {
     backgroundColor: "#f5e6d2",
     borderRadius: 12,
     padding: 12,
     gap: 8,
+    borderWidth: 1,
+    borderColor: "#e0c9a0",
   },
-  confirmText: { color: "#1c1915" },
+  confirmBadge: {
+    alignSelf: "flex-start",
+    fontSize: 11,
+    fontWeight: "700",
+    color: "#8a5a20",
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+  },
+  confirmTitle: {
+    color: "#1c1915",
+    fontWeight: "700",
+    fontSize: 15,
+  },
+  confirmSummary: {
+    color: "#5c564c",
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  confirmCommandBox: {
+    backgroundColor: "#1c1915",
+    borderRadius: 10,
+    padding: 10,
+    gap: 4,
+  },
+  confirmCommandLabel: {
+    color: "#a39e93",
+    fontSize: 11,
+    fontWeight: "700",
+    textTransform: "uppercase",
+  },
+  confirmCommand: {
+    color: "#f7f4ee",
+    fontFamily: Platform.OS === "ios" ? "Menlo" : "monospace",
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  confirmActions: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    marginTop: 2,
+  },
+  confirmBtn: {
+    backgroundColor: "#ebe4d6",
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+    borderRadius: 10,
+  },
+  confirmBtnRun: { backgroundColor: "#2f5d3a" },
+  confirmBtnCancel: { backgroundColor: "#5c564c" },
+  confirmBtnHigh: { backgroundColor: "#8a4030" },
+  confirmBtnText: { color: "#1c1915", fontWeight: "700", fontSize: 14 },
+  confirmBtnTextOn: { color: "#f7f4ee" },
   live: { color: "#2f5d3a", fontSize: 12 },
   error: { color: "#9b2c1a" },
   warn: {
@@ -1207,51 +1695,23 @@ const styles = StyleSheet.create({
   },
   warnTitle: { fontWeight: "700", color: "#1c1915" },
   warnBody: { color: "#5c564c", fontSize: 13, lineHeight: 18 },
-  modalBackdrop: {
-    flex: 1,
-    backgroundColor: "rgba(0,0,0,0.35)",
-    justifyContent: "flex-end",
-  },
-  modalSheet: {
-    backgroundColor: "#f7f4ee",
-    borderTopLeftRadius: 18,
-    borderTopRightRadius: 18,
-    padding: 16,
-  },
-  modalTitle: {
-    fontSize: 13,
-    fontWeight: "700",
-    color: "#7a7368",
-    textTransform: "uppercase",
-    marginBottom: 8,
-  },
-  modalItem: {
-    paddingVertical: 12,
-    paddingHorizontal: 12,
-    borderRadius: 10,
-    marginBottom: 4,
-  },
-  modalItemOn: { backgroundColor: "#ebe4d6" },
-  modalItemText: { color: "#1c1915", fontWeight: "600" },
-  sectionLabel: {
-    fontSize: 12,
-    fontWeight: "700",
-    color: "#7a7368",
-    textTransform: "uppercase",
-    marginBottom: 6,
-  },
-  toggleRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    backgroundColor: "#fffdf8",
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 8,
+  readonlyBanner: {
+    backgroundColor: "#ebe4d6",
+    borderRadius: 12,
+    padding: 12,
+    gap: 4,
     borderWidth: 1,
-    borderColor: "#e5dfd2",
+    borderColor: "#d5cfc2",
   },
-  hostSync: { color: "#6f685c", fontSize: 12, marginBottom: 8 },
+  readonlyTitle: { color: "#5c564c", fontWeight: "700", fontSize: 14 },
+  readonlyBody: { color: "#6f685c", fontSize: 13, lineHeight: 18 },
+  composerReadonlyHint: {
+    color: "#7a7368",
+    fontSize: 13,
+    fontWeight: "600",
+    textAlign: "center",
+    paddingVertical: 4,
+  },
   systemBubble: {
     backgroundColor: "#ece8df",
     borderRadius: 10,
@@ -1304,12 +1764,4 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
   },
   changedPath: { color: "#1c1915", fontSize: 13, fontWeight: "600" },
-  effortChip: {
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 999,
-    backgroundColor: "#fffdf8",
-    borderWidth: 1,
-    borderColor: "#e5dfd2",
-  },
 });

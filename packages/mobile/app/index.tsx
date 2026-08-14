@@ -13,6 +13,8 @@ import {
 import { Link, router } from "expo-router";
 import type { ComposerHealth, Project } from "@cursor-remote/shared";
 import { useConnection } from "../lib/connection";
+import { useComposerWatch } from "../lib/composer-watch";
+import { PulseDot } from "../lib/pulse-dot";
 import type { HostProfile } from "../lib/api";
 
 export default function HomeScreen() {
@@ -26,6 +28,7 @@ export default function HomeScreen() {
     removeHost,
     disconnect,
   } = useConnection();
+  const { hostRunning, hostStatus, pendingApprovals } = useComposerWatch();
   const [projects, setProjects] = useState<Project[]>([]);
   const [health, setHealth] = useState<ComposerHealth | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -218,10 +221,22 @@ export default function HomeScreen() {
           ) : null}
         </View>
       ) : null}
+      {hostRunning || pendingApprovals > 0 ? (
+        <View style={styles.hostBusy}>
+          <PulseDot />
+          <Text style={styles.hostBusyText} numberOfLines={1}>
+            {pendingApprovals > 0
+              ? `${pendingApprovals} waiting for approval`
+              : `Agent running${hostStatus ? ` · ${hostStatus}` : ""}`}
+          </Text>
+        </View>
+      ) : null}
       <Text style={styles.section}>Projects</Text>
       {projects.map((p) => (
         <Link key={p.id} href={`/projects/${p.id}`} asChild>
-          <Pressable style={styles.card}>
+          <Pressable
+            style={({ pressed }) => [styles.card, pressed && styles.pressedSoft]}
+          >
             <Text style={styles.cardTitle}>{p.name}</Text>
             <Text style={styles.cardPath} numberOfLines={2}>
               {p.path}
@@ -324,6 +339,17 @@ const styles = StyleSheet.create({
   },
   cardTitle: { fontSize: 17, fontWeight: "600", color: "#1c1915" },
   cardPath: { marginTop: 4, color: "#6f685c", fontSize: 13 },
+  pressedSoft: { opacity: 0.7 },
+  hostBusy: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: "#f5e6d2",
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 7,
+  },
+  hostBusyText: { flex: 1, color: "#8a5a20", fontSize: 12, fontWeight: "600" },
   empty: { color: "#6f685c" },
   primary: {
     backgroundColor: "#1c1915",

@@ -14,6 +14,12 @@
         {
           "cameraPermission": "Scan the pairing QR from the daemon host."
         }
+      ],
+      [
+        "expo-notifications",
+        {
+          "color": "#2f5d3a"
+        }
       ]
     ],
     "ios": {
@@ -36,7 +42,8 @@
         "INTERNET",
         "ACCESS_NETWORK_STATE",
         "READ_MEDIA_IMAGES",
-        "READ_EXTERNAL_STORAGE"
+        "READ_EXTERNAL_STORAGE",
+        "POST_NOTIFICATIONS"
       ]
     },
     "experiments": {
