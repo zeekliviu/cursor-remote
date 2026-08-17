@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { randomUUID } from "node:crypto";
 import * as pty from "node-pty";
 import type { WebSocket } from "ws";
 import type {
@@ -12,9 +13,13 @@ import type {
 const require = createRequire(import.meta.url);
 
 type Session = {
+  id: string;
   term: pty.IPty;
   projectId: string;
   cwd: string;
+  ws: WebSocket | null;
+  buffered: string;
+  expiry: NodeJS.Timeout | null;
 };
 
 function send(ws: WebSocket, msg: TerminalServerMessage): void {
@@ -49,7 +54,8 @@ function resolveShell(): { file: string; args: string[] } {
 }
 
 export class TerminalHub {
-  private sessions = new WeakMap<WebSocket, Session>();
+  private readonly sessions = new Map<string, Session>();
+  private readonly socketSessions = new WeakMap<WebSocket, string>();
 
   handle(ws: WebSocket, resolveCwd: (projectId: string) => string | undefined): void {
     ws.on("message", (raw) => {
@@ -67,7 +73,7 @@ export class TerminalHub {
       }
 
       if (msg.type === "attach") {
-        this.dispose(ws);
+        this.detach(ws);
         const cwd = resolveCwd(msg.projectId);
         if (!cwd) {
           send(ws, { type: "error", message: "unknown project" });
@@ -78,6 +84,32 @@ export class TerminalHub {
             type: "error",
             message: `project path missing or not a directory: ${cwd}`,
           });
+          return;
+        }
+        const existing = msg.sessionId
+          ? this.sessions.get(msg.sessionId)
+          : undefined;
+        if (existing && existing.projectId === msg.projectId) {
+          if (existing.expiry) clearTimeout(existing.expiry);
+          existing.expiry = null;
+          if (existing.ws && existing.ws !== ws) {
+            this.socketSessions.delete(existing.ws);
+          }
+          existing.ws = ws;
+          this.socketSessions.set(ws, existing.id);
+          if (msg.cols && msg.rows) {
+            existing.term.resize(msg.cols, msg.rows);
+          }
+          send(ws, {
+            type: "ready",
+            projectId: existing.projectId,
+            cwd: existing.cwd,
+            sessionId: existing.id,
+          });
+          if (existing.buffered) {
+            send(ws, { type: "data", data: existing.buffered });
+            existing.buffered = "";
+          }
           return;
         }
         ensurePtyPermissions();
@@ -104,17 +136,39 @@ export class TerminalHub {
           });
           return;
         }
-        term.onData((data) => send(ws, { type: "data", data }));
-        term.onExit(({ exitCode }) => {
-          send(ws, { type: "exit", code: exitCode });
-          this.dispose(ws);
+        const id = randomUUID();
+        const session: Session = {
+          id,
+          term,
+          projectId: msg.projectId,
+          cwd,
+          ws,
+          buffered: "",
+          expiry: null,
+        };
+        term.onData((data) => {
+          if (session.ws) {
+            send(session.ws, { type: "data", data });
+          } else {
+            session.buffered = (session.buffered + data).slice(-65536);
+          }
         });
-        this.sessions.set(ws, { term, projectId: msg.projectId, cwd });
-        send(ws, { type: "ready", projectId: msg.projectId, cwd });
+        term.onExit(({ exitCode }) => {
+          if (session.ws) {
+            send(session.ws, { type: "exit", code: exitCode });
+            this.socketSessions.delete(session.ws);
+          }
+          if (session.expiry) clearTimeout(session.expiry);
+          this.sessions.delete(session.id);
+        });
+        this.sessions.set(id, session);
+        this.socketSessions.set(ws, id);
+        send(ws, { type: "ready", projectId: msg.projectId, cwd, sessionId: id });
         return;
       }
 
-      const session = this.sessions.get(ws);
+      const sessionId = this.socketSessions.get(ws);
+      const session = sessionId ? this.sessions.get(sessionId) : undefined;
       if (!session) {
         send(ws, { type: "error", message: "not attached" });
         return;
@@ -129,18 +183,46 @@ export class TerminalHub {
       }
     });
 
-    ws.on("close", () => this.dispose(ws));
+    ws.on("close", () => this.detach(ws));
   }
 
-  private dispose(ws: WebSocket): void {
-    const session = this.sessions.get(ws);
+  close(): void {
+    for (const session of this.sessions.values()) {
+      if (session.expiry) clearTimeout(session.expiry);
+      try {
+        session.term.kill();
+      } catch {
+        // ignore
+      }
+    }
+    this.sessions.clear();
+  }
+
+  private detach(ws: WebSocket): void {
+    const id = this.socketSessions.get(ws);
+    if (!id) return;
+    const session = this.sessions.get(id);
     if (!session) return;
+    this.socketSessions.delete(ws);
+    if (session.ws === ws) session.ws = null;
+    if (session.expiry) clearTimeout(session.expiry);
+    session.expiry = setTimeout(
+      () => this.destroySession(id),
+      60 * 60 * 1000,
+    );
+    session.expiry.unref?.();
+  }
+
+  private destroySession(id: string): void {
+    const session = this.sessions.get(id);
+    if (!session) return;
+    if (session.expiry) clearTimeout(session.expiry);
     try {
       session.term.kill();
     } catch {
       // ignore
     }
-    this.sessions.delete(ws);
+    this.sessions.delete(id);
   }
 }
 

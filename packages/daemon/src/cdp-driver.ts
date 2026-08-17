@@ -66,6 +66,11 @@ export class CdpDriver {
   private targetId: string | null = null;
   private readonly locks = new Map<string, Promise<void>>();
   private lastDomFingerprint = "";
+  private composerMutationHandler: (() => void) | null = null;
+  private readonly observerPages = new WeakSet<Page>();
+  private composerObserverGeneration = 0;
+  private observedPage: Page | null = null;
+  private composerObserverRetry: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly cdpUrl: string,
@@ -74,6 +79,250 @@ export class CdpDriver {
 
   get selectorPackName(): string {
     return this.selectors.name;
+  }
+
+  /**
+   * Install one debounced observer inside Cursor's renderer. It only wakes the
+   * daemon for Composer/approval mutations; the monitor then performs a
+   * canonical scrape and state-key dedupe.
+   */
+  async setComposerMutationHandler(handler: (() => void) | null): Promise<void> {
+    const generation = ++this.composerObserverGeneration;
+    this.composerMutationHandler = handler;
+    const page = this.observedPage || this.page;
+    if (!handler) {
+      if (this.composerObserverRetry) {
+        clearTimeout(this.composerObserverRetry);
+        this.composerObserverRetry = null;
+      }
+      if (page) {
+        await page
+          .evaluate(() => {
+            const state = window as unknown as {
+              __cursorRemoteObserver?: MutationObserver;
+              __cursorRemoteObserverTimer?: ReturnType<typeof setTimeout>;
+              __cursorRemoteObserverFingerprint?: string;
+            };
+            state.__cursorRemoteObserver?.disconnect();
+            if (state.__cursorRemoteObserverTimer) {
+              clearTimeout(state.__cursorRemoteObserverTimer);
+            }
+            delete state.__cursorRemoteObserver;
+            delete state.__cursorRemoteObserverTimer;
+            delete state.__cursorRemoteObserverFingerprint;
+          })
+          .catch(() => undefined);
+      }
+      this.observedPage = null;
+      return;
+    }
+
+    const activePage = await this.ensurePage();
+    if (
+      generation !== this.composerObserverGeneration ||
+      !this.composerMutationHandler
+    ) {
+      return;
+    }
+    if (
+      this.observedPage === activePage &&
+      this.observerPages.has(activePage)
+    ) {
+      return;
+    }
+    if (this.observedPage && this.observedPage !== activePage) {
+      await this.observedPage
+        .evaluate(() => {
+          const state = window as unknown as {
+            __cursorRemoteObserver?: MutationObserver;
+            __cursorRemoteObserverTimer?: ReturnType<typeof setTimeout>;
+          };
+          state.__cursorRemoteObserver?.disconnect();
+          if (state.__cursorRemoteObserverTimer) {
+            clearTimeout(state.__cursorRemoteObserverTimer);
+          }
+        })
+        .catch(() => undefined);
+    }
+    if (!this.observerPages.has(activePage)) {
+      await activePage.exposeFunction(
+        "__cursorRemoteComposerMutation",
+        () => this.composerMutationHandler?.(),
+      );
+      this.observerPages.add(activePage);
+      activePage.on("framenavigated", (frame) => {
+        if (
+          frame === activePage.mainFrame() &&
+          this.observedPage === activePage
+        ) {
+          this.observedPage = null;
+          const current = this.composerMutationHandler;
+          if (current) this.scheduleComposerObserverRetry();
+        }
+      });
+    }
+    if (
+      generation !== this.composerObserverGeneration ||
+      !this.composerMutationHandler
+    ) {
+      return;
+    }
+    await activePage.evaluate(() => {
+      const state = window as unknown as {
+        __cursorRemoteObserver?: MutationObserver;
+        __cursorRemoteObserverTimer?: ReturnType<typeof setTimeout>;
+        __cursorRemoteComposerMutation?: () => void;
+        __cursorRemoteObserverFingerprint?: string;
+      };
+      state.__cursorRemoteObserver?.disconnect();
+      const relevantSelector = [
+        ".agent-transcript-row-activity",
+        ".ui-step-group-collapsible",
+        "[class*='agent-transcript-activity']",
+        "[role='dialog']",
+        ".monaco-dialog-box",
+        "[class*='confirmation']",
+        "[class*='Confirmation']",
+        "[class*='approval']",
+        "[class*='Approval']",
+        "[class*='pending-decision']",
+        "[data-testid*='confirm']",
+        "[data-testid*='approval']",
+      ].join(",");
+      const isDecisionButton = (element: Element): boolean => {
+        const candidates = [
+          element.matches("button,[role='button']") ? element : null,
+          element.closest("button,[role='button']"),
+          ...Array.from(element.querySelectorAll("button,[role='button']")).slice(
+            0,
+            8,
+          ),
+        ].filter((candidate): candidate is Element => Boolean(candidate));
+        return candidates.some((candidate) => {
+          const label = (
+            candidate.getAttribute("aria-label") ||
+            candidate.getAttribute("title") ||
+            (candidate as HTMLElement).innerText ||
+            ""
+          )
+            .replace(/\s+/g, " ")
+            .trim();
+          return /^(stop|run|allow|accept|approve|continue|confirm|skip|reject|deny|cancel|always run|always allow|don'?t ask again)(\s|$)/i.test(
+            label,
+          );
+        });
+      };
+      const isVisible = (element: Element): boolean => {
+        const html = element as HTMLElement;
+        const rect = html.getBoundingClientRect();
+        if (rect.width < 2 && rect.height < 2) return false;
+        const style = window.getComputedStyle(html);
+        return style.display !== "none" && style.visibility !== "hidden";
+      };
+      const composerFingerprint = (): string => {
+        const liveRe =
+          /^(Thinking|Planning|Exploring|Making edits|Running|Searching|Editing|Generating)\b/i;
+        const activity = Array.from(
+          document.querySelectorAll(
+            ".agent-transcript-row-activity, .ui-step-group-collapsible, [class*='agent-transcript-activity']",
+          ),
+        )
+          .filter(isVisible)
+          .map(
+            (element) =>
+              ((element as HTMLElement).innerText || "").trim().split("\n")[0] ||
+              "",
+          )
+          .filter((text) => liveRe.test(text))
+          .slice(-5);
+        const decisions = Array.from(
+          document.querySelectorAll("button,[role='button']"),
+        )
+          .filter(isVisible)
+          .map((element) => {
+            const label = (
+              element.getAttribute("aria-label") ||
+              element.getAttribute("title") ||
+              (element as HTMLElement).innerText ||
+              ""
+            )
+              .replace(/\s+/g, " ")
+              .trim();
+            if (
+              !/^(stop|run|allow|accept|approve|continue|confirm|skip|reject|deny|cancel|always run|always allow|don'?t ask again)(\s|$)/i.test(
+                label,
+              )
+            ) {
+              return "";
+            }
+            const context = (
+              (element.parentElement as HTMLElement | null)?.innerText || ""
+            )
+              .replace(/\s+/g, " ")
+              .trim()
+              .slice(0, 240);
+            return `${label}|${context}`;
+          })
+          .filter(Boolean)
+          .slice(-8);
+        return JSON.stringify([activity, decisions]);
+      };
+      const isRelevant = (node: Node): boolean => {
+        const element =
+          node.nodeType === Node.ELEMENT_NODE
+            ? (node as Element)
+            : node.parentElement;
+        return Boolean(
+          element?.matches(relevantSelector) ||
+            element?.closest(relevantSelector) ||
+            element?.querySelector(relevantSelector) ||
+            (element && isDecisionButton(element)),
+        );
+      };
+      state.__cursorRemoteObserver = new MutationObserver((mutations) => {
+        if (
+          !mutations.some(
+            (mutation) =>
+              isRelevant(mutation.target) ||
+              Array.from(mutation.addedNodes).some(isRelevant) ||
+              Array.from(mutation.removedNodes).some(isRelevant),
+          )
+        ) {
+          return;
+        }
+        if (state.__cursorRemoteObserverTimer) {
+          clearTimeout(state.__cursorRemoteObserverTimer);
+        }
+        state.__cursorRemoteObserverTimer = setTimeout(() => {
+          const fingerprint = composerFingerprint();
+          if (fingerprint === state.__cursorRemoteObserverFingerprint) return;
+          state.__cursorRemoteObserverFingerprint = fingerprint;
+          state.__cursorRemoteComposerMutation?.();
+        }, 180);
+      });
+      state.__cursorRemoteObserverFingerprint = composerFingerprint();
+      state.__cursorRemoteObserver.observe(document.body, {
+        subtree: true,
+        childList: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: ["aria-label", "class", "disabled"],
+      });
+    });
+    this.observedPage = activePage;
+  }
+
+  private scheduleComposerObserverRetry(): void {
+    if (this.composerObserverRetry || !this.composerMutationHandler) return;
+    this.composerObserverRetry = setTimeout(() => {
+      this.composerObserverRetry = null;
+      const current = this.composerMutationHandler;
+      if (!current) return;
+      void this.setComposerMutationHandler(current).catch(() => {
+        this.scheduleComposerObserverRetry();
+      });
+    }, 300);
+    this.composerObserverRetry.unref?.();
   }
 
   reloadSelectors(name = "default"): void {
@@ -1593,6 +1842,27 @@ export class CdpDriver {
     return menu.models;
   }
 
+  /** Canonical Composer state sample used by the shared daemon monitor. */
+  async scrapeComposerState(): Promise<{
+    activity: {
+      status?: string;
+      labels: string[];
+      currentModel?: string;
+      running?: boolean;
+      lastCompletedLabel?: string;
+      lastCompletedDurationMs?: number;
+      lastCompletedFingerprint?: string;
+      currentChatId?: string;
+    };
+    confirmations: Confirmation[];
+  }> {
+    const [activity, confirmations] = await Promise.all([
+      this.scrapeAgentActivity(),
+      this.listConfirmations(),
+    ]);
+    return { activity, confirmations };
+  }
+
   async pollDomEvents(): Promise<{ kind: string; text?: string } | null> {
     const page = await this.ensurePage();
     const snapshot = await page.evaluate((selectors) => {
@@ -1622,6 +1892,10 @@ export class CdpDriver {
     labels: string[];
     currentModel?: string;
     running?: boolean;
+    lastCompletedLabel?: string;
+    lastCompletedDurationMs?: number;
+    lastCompletedFingerprint?: string;
+    currentChatId?: string;
   }> {
     const page = await this.ensurePage();
     return page.evaluate(() => {
@@ -1643,10 +1917,35 @@ export class CdpDriver {
           ".agent-transcript-row-activity, .ui-step-group-collapsible, [class*='agent-transcript-activity']",
         ),
       ) as HTMLElement[];
+      let lastCompletedLabel: string | undefined;
+      let lastCompletedDurationMs: number | undefined;
+      let lastCompletedFingerprint: string | undefined;
 
-      for (const el of roots) {
-        const first = (el.innerText || "").trim().split("\n")[0] || "";
+      for (const [rootIndex, el] of roots.entries()) {
+        const first = (el.innerText || "")
+          .trim()
+          .split("\n")[0]
+          ?.replace(/\s+/g, " ")
+          .trim() || "";
         if (liveRe.test(first)) push(first);
+        const worked = first.match(
+          /^Worked for\s+(?:(\d+)\s*h(?:ours?)?\s*)?(?:(\d+)\s*m(?:in(?:utes?)?)?\s*)?(?:(\d+)\s*s(?:ec(?:onds?)?)?)?/i,
+        );
+        if (worked) {
+          const hours = Number(worked[1] || 0);
+          const minutes = Number(worked[2] || 0);
+          const seconds = Number(worked[3] || 0);
+          lastCompletedLabel = first;
+          lastCompletedFingerprint = [
+            roots.length,
+            rootIndex,
+            first,
+            el.id || "",
+            el.getAttribute("data-testid") || "",
+          ].join(":");
+          const duration = (hours * 3600 + minutes * 60 + seconds) * 1000;
+          if (duration > 0) lastCompletedDurationMs = duration;
+        }
       }
 
       for (const el of Array.from(
@@ -1730,6 +2029,13 @@ export class CdpDriver {
         .replace(/\s+/g, " ")
         .trim()
         .split("\n")[0];
+      const currentChatId = (
+        window as unknown as {
+          __cursorComposerVirtualizationDebug?: {
+            getSnapshot?: () => { composerId?: string } | undefined;
+          };
+        }
+      ).__cursorComposerVirtualizationDebug?.getSnapshot?.()?.composerId;
 
       return {
         // Only surface a status string when we believe the agent is actually running.
@@ -1737,6 +2043,10 @@ export class CdpDriver {
         labels: labels.slice(-10),
         currentModel: currentModel || undefined,
         running,
+        lastCompletedLabel,
+        lastCompletedDurationMs,
+        lastCompletedFingerprint,
+        currentChatId,
       };
     });
   }
@@ -1750,17 +2060,21 @@ export class CdpDriver {
           .replace(/\s+/g, " ")
           .trim();
       const actionWords =
-        /^(run|allow|accept|continue|confirm|approve|yes|skip|reject|deny|cancel|don'?t ask again|always allow)(\s|$)/i;
+        /^(run|allow|accept|continue|confirm|approve|yes|skip|reject|deny|cancel|don'?t ask again|always allow|always run|run always)(\s|$)/i;
 
       type Raw = {
         id: string;
         text: string;
         summary?: string;
         command?: string;
+        kind?: "shell" | "network" | "delete" | "externalFile" | "mcp" | "browser" | "generic";
+        risk?: "low" | "medium" | "high";
+        resource?: string;
         actions: Array<{
           id: string;
           label: string;
           risk: "low" | "medium" | "high";
+          intent?: "deny" | "allowOnce" | "allowAlways" | "other";
         }>;
         /** DOM identity for nested dedupe */
         _el: Element;
@@ -1772,7 +2086,7 @@ export class CdpDriver {
         const lower = label.toLowerCase();
         if (
           /delete|overwrite|force|rm\s|format|drop\s/i.test(lower) ||
-          lower.includes("always allow")
+          /always (allow|run)|run always|don'?t ask again/.test(lower)
         ) {
           return "high";
         }
@@ -1786,6 +2100,19 @@ export class CdpDriver {
         const first = normalize(raw).split("\n")[0].trim();
         // "Run ↵" / "Run Enter" → "Run"
         return first.replace(/\s*(enter|return)$/i, "").trim();
+      };
+
+      const intentFor = (
+        label: string,
+      ): "deny" | "allowOnce" | "allowAlways" | "other" => {
+        if (/always run|always allow|don'?t ask again|run always/i.test(label)) {
+          return "allowAlways";
+        }
+        if (/^(run|allow|accept|continue|confirm|approve|yes)(\s|$)/i.test(label)) {
+          return "allowOnce";
+        }
+        if (/^(skip|reject|deny|cancel|no)(\s|$)/i.test(label)) return "deny";
+        return "other";
       };
 
       const collectActions = (root: Element) => {
@@ -1817,6 +2144,7 @@ export class CdpDriver {
             id: `${actions.length}:${label}`,
             label,
             risk: riskFor(label),
+            intent: intentFor(label),
           });
         }
         return actions;
@@ -1868,7 +2196,7 @@ export class CdpDriver {
         const stripped = stripActionLabels(text, actions);
         if (!stripped) return true;
         // "Skip Run" alone, or only action-ish words
-        if (/^(skip|run|allow|cancel|reject|deny|yes|no)(\s+(skip|run|allow|cancel|reject|deny|yes|no))*$/i.test(stripped)) {
+        if (/^(skip|run|allow|cancel|reject|deny|yes|no|always run|always allow)(\s+(skip|run|allow|cancel|reject|deny|yes|no|always run|always allow))*$/i.test(stripped)) {
           return true;
         }
         return stripped.length < 4;
@@ -1909,7 +2237,9 @@ export class CdpDriver {
             (b as HTMLElement).innerText ||
             "",
         );
-        return /^(run|allow|accept|approve|skip)$/i.test(label);
+        return /^(run|allow|approve|skip|reject|deny|always run|always allow|don'?t ask again)(\s|$)/i.test(
+          label,
+        );
       });
 
       for (const btn of decisionButtons) {
@@ -1922,6 +2252,25 @@ export class CdpDriver {
             continue;
           }
           const raw = normalize((root as HTMLElement).innerText || "");
+          const explicitApproval = root.matches(
+            "[role='dialog'], .monaco-dialog-box, [class*='confirmation'], [class*='Confirmation'], [class*='approval'], [class*='Approval'], [class*='pending-decision'], [class*='tool-call-card'], [data-testid*='confirm'], [data-testid*='approval']",
+          );
+          const approvalLanguage =
+            /approval|permission|needs access|allow|always run|skip|delete|outside (the )?workspace|network|run (this )?command/i.test(
+              raw,
+            );
+          const hasSafetyAction = actions.some((action) =>
+            /skip|allow|approve|deny|reject|always|don'?t ask/i.test(
+              action.label,
+            ),
+          );
+          if (
+            !explicitApproval &&
+            !(actions.length >= 2 && approvalLanguage && hasSafetyAction)
+          ) {
+            root = root.parentElement;
+            continue;
+          }
           if (!isButtonOnlyNoise(raw, actions)) {
             best = root;
             break;
@@ -1936,7 +2285,7 @@ export class CdpDriver {
         const actions = collectActions(el);
         if (actions.length === 0) continue;
         const hasDecision = actions.some((a) =>
-          /run|allow|accept|approve|skip|cancel|reject|deny/i.test(a.label),
+          /run|allow|accept|approve|skip|cancel|reject|deny|don'?t ask/i.test(a.label),
         );
         if (!hasDecision) continue;
 
@@ -1968,6 +2317,50 @@ export class CdpDriver {
           return true;
         });
         const summary = summaryLines.slice(0, 6).join("\n").slice(0, 600);
+        const classificationText = `${title}\n${cleaned}\n${command || ""}`;
+        const kind: Raw["kind"] =
+          /outside (the )?workspace|external file|protected path|outside.*directory/i.test(
+                  classificationText,
+                )
+            ? "externalFile"
+            : /delete|remove file|rm\s|unlink/i.test(classificationText)
+              ? "delete"
+              : /network|internet|fetch|web search|connect to|domain|https?:\/\//i.test(
+                    classificationText,
+                  )
+                ? "network"
+                : /\bmcp\b|model context protocol/i.test(classificationText)
+                  ? "mcp"
+                  : /browser|navigate|page|screenshot/i.test(classificationText)
+                    ? "browser"
+                    : command ||
+                        /terminal|shell|command|powershell|bash|zsh/i.test(
+                          classificationText,
+                        )
+                      ? "shell"
+                      : "generic";
+        const persistent = actions.some((action) => action.intent === "allowAlways");
+        const risk: Raw["risk"] =
+          kind === "delete" || kind === "externalFile" || persistent
+            ? "high"
+            : kind === "shell" ||
+                kind === "network" ||
+                kind === "mcp" ||
+                kind === "browser"
+              ? "medium"
+              : "low";
+        const url = classificationText.match(/https?:\/\/[^\s"'`<>]+/i)?.[0];
+        const pathMatch = classificationText.match(
+          /(?:[A-Za-z]:\\|\/)[^\n"'`]+/,
+        )?.[0];
+        const resource =
+          kind === "network"
+            ? url
+            : kind === "delete" || kind === "externalFile"
+              ? pathMatch
+              : kind === "mcp"
+                ? lines.find((line) => /\bmcp\b/i.test(line))
+                : undefined;
 
         // Prefer cards with a real title/command and more unique content.
         const score =
@@ -1980,6 +2373,9 @@ export class CdpDriver {
           text: title.slice(0, 160),
           summary: summary && summary !== title ? summary : undefined,
           command,
+          kind,
+          risk,
+          resource: resource?.slice(0, 500),
           actions,
           _el: el,
           _score: score,
@@ -2019,6 +2415,8 @@ export class CdpDriver {
         const raw = [
           item.text,
           item.command || "",
+          item.kind || "",
+          item.resource || "",
           item.actions.map((a) => a.label).join("|"),
         ].join("::");
         let h = 0;
@@ -2048,16 +2446,26 @@ export class CdpDriver {
     await activateCursorApp();
     const page = await this.ensurePage();
     await this.activateCurrentPage();
-    return page.evaluate((label) => {
-      const want = label
+    return page.evaluate((target) => {
+      const normalize = (value: string) =>
+        value.replace(/[↵⏎]/g, "").replace(/\s+/g, " ").trim().toLowerCase();
+      const want = target.label
         .replace(/[↵⏎]/g, "")
         .replace(/\s+/g, " ")
         .trim()
         .toLowerCase()
         .replace(/\s*(enter|return)$/i, "");
+      const commandNeedle = target.command
+        ? normalize(target.command)
+        : "";
+      const resourceNeedle = target.resource
+        ? normalize(target.resource)
+        : "";
+      const textNeedle = target.text ? normalize(target.text) : "";
       const buttons = Array.from(
         document.querySelectorAll("button, [role='button'], a.monaco-button"),
       );
+      let best: { el: HTMLElement; score: number } | null = null;
       for (const btn of buttons) {
         const el = btn as HTMLElement;
         const t = (
@@ -2072,19 +2480,56 @@ export class CdpDriver {
           .split("\n")[0]
           .toLowerCase()
           .replace(/\s*(enter|return)$/i, "");
-        if (t === want || t.startsWith(want + " ")) {
-          el.click();
-          return true;
+        if (t !== want && !t.startsWith(want + " ")) continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width < 2 || rect.height < 2) continue;
+        let root: Element | null = el.parentElement;
+        let score: number | null = null;
+        for (let depth = 0; depth < 8 && root; depth += 1) {
+          const body = normalize((root as HTMLElement).innerText || "");
+          if (commandNeedle && body.includes(commandNeedle)) {
+            score = 1000 - Math.min(body.length, 900);
+            break;
+          }
+          if (!commandNeedle && resourceNeedle && body.includes(resourceNeedle)) {
+            score = 750 - Math.min(body.length, 650);
+            break;
+          }
+          if (
+            !commandNeedle &&
+            !resourceNeedle &&
+            textNeedle &&
+            body.includes(textNeedle)
+          ) {
+            score = 500 - Math.min(body.length, 450);
+            break;
+          }
+          root = root.parentElement;
         }
+        if (score == null) continue;
+        if (!best || score > best.score) best = { el, score };
       }
-      return false;
-    }, action.label);
+      if (!best) return false;
+      best.el.click();
+      return true;
+    }, {
+      label: action.label,
+      text: conf.text,
+      command: conf.command,
+      resource: conf.resource,
+    });
   }
 
   private async ensurePage(targetId?: string): Promise<Page> {
     if (!this.browser) await this.connect();
     const browser = this.browser!;
-    if (targetId && this.targetId === targetId && this.page) return this.page;
+    if (
+      this.page &&
+      !this.page.isClosed() &&
+      (!targetId || this.targetId === targetId)
+    ) {
+      return this.page;
+    }
 
     const pages = await browser.pages();
     let page: Page | undefined;

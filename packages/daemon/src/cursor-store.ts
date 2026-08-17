@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import Database from "better-sqlite3";
 import type {
   ChatChangedFile,
@@ -278,7 +279,160 @@ function attachImagesToUserMessages(messages: ChatMessage[]): ChatMessage[] {
 }
 
 export class CursorStore {
+  private subagentCacheKey = "";
+  private subagentCache = new Set<string>();
+  private readonly chatCache = new Map<
+    string,
+    { revision: string; detail: ChatDetail }
+  >();
+
   constructor(private readonly paths: CursorPaths) {}
+
+  getChatWatchPaths(): string[] {
+    return [
+      this.paths.globalDb,
+      `${this.paths.globalDb}-wal`,
+      `${this.paths.globalDb}-shm`,
+    ];
+  }
+
+  private globalDbRevision(): string {
+    return this.getChatWatchPaths()
+      .map((filePath) => {
+        try {
+          const stat = fs.statSync(filePath);
+          return `${stat.mtimeMs}:${stat.size}`;
+        } catch {
+          return "missing";
+        }
+      })
+      .join("|");
+  }
+
+  getChatRevision(chatId: string): string | null {
+    const db = openReadonly(this.paths.globalDb);
+    if (!db) return null;
+    try {
+      const composerRow = db
+        .prepare("SELECT value FROM cursorDiskKV WHERE key = ?")
+        .get(`composerData:${chatId}`) as { value: string } | undefined;
+      if (!composerRow) return null;
+      const hash = createHash("sha1").update(composerRow.value);
+      try {
+        const data = JSON.parse(composerRow.value) as ComposerData;
+        const headers = data.fullConversationHeadersOnly || [];
+        const bubbleKeys = headers.map(
+          (header) => `bubbleId:${chatId}:${header.bubbleId}`,
+        );
+        const bubbleValues = new Map<string, string>();
+        for (let start = 0; start < bubbleKeys.length; start += 400) {
+          const keys = bubbleKeys.slice(start, start + 400);
+          if (!keys.length) continue;
+          const placeholders = keys.map(() => "?").join(",");
+          const rows = db
+            .prepare(
+              `SELECT key, value FROM cursorDiskKV WHERE key IN (${placeholders})`,
+            )
+            .all(...keys) as Array<{ key: string; value: string }>;
+          for (const row of rows) bubbleValues.set(row.key, row.value);
+        }
+        const contentKeys = new Set<string>();
+        const imageDependencies = new Set<string>();
+        const contentKeyRe =
+          /\\?"(?:beforeContentId|afterContentId|contentKey)\\?"\s*:\s*\\?"([^"\\]+)\\?"/g;
+        for (const key of bubbleKeys) {
+          const value = bubbleValues.get(key) || "";
+          hash.update("\0").update(key).update("\0").update(value);
+          for (const match of value.matchAll(contentKeyRe)) {
+            if (match[1]) contentKeys.add(match[1]);
+          }
+          try {
+            const bubble = JSON.parse(value) as {
+              text?: string;
+              images?: Array<{ uuid?: string; path?: string }>;
+              toolFormerData?: { params?: unknown; rawArgs?: unknown };
+            };
+            for (const image of bubble.images || []) {
+              if (image.path && isImagePath(image.path)) {
+                const resolved = path.resolve(image.path);
+                imageDependencies.add(
+                  `${resolved}:${fs.existsSync(resolved) ? 1 : 0}`,
+                );
+              } else if (image.uuid) {
+                const resolved = resolveImageUuid(
+                  this.paths.workspaceStorage,
+                  image.uuid,
+                );
+                imageDependencies.add(
+                  `uuid:${image.uuid}:${resolved || "missing"}`,
+                );
+              }
+            }
+            const toolPath = extractImagePathFromTool(
+              bubble.toolFormerData?.params,
+              bubble.toolFormerData?.rawArgs,
+            );
+            if (toolPath && isImagePath(toolPath)) {
+              const resolved = path.resolve(toolPath);
+              imageDependencies.add(
+                `${resolved}:${fs.existsSync(resolved) ? 1 : 0}`,
+              );
+            }
+            for (const phonePath of extractPhoneAttachmentPaths(
+              bubble.text || "",
+            ).paths) {
+              const resolved = path.resolve(phonePath);
+              imageDependencies.add(
+                `${resolved}:${fs.existsSync(resolved) ? 1 : 0}`,
+              );
+            }
+          } catch {
+            // Bubble parsing errors are handled by the full chat reader.
+          }
+        }
+        for (const dependency of Array.from(imageDependencies).sort()) {
+          hash.update("\0image:").update(dependency);
+        }
+        for (const match of composerRow.value.matchAll(contentKeyRe)) {
+          if (match[1]) contentKeys.add(match[1]);
+        }
+        const sortedContentKeys = Array.from(contentKeys).sort();
+        for (let start = 0; start < sortedContentKeys.length; start += 400) {
+          const keys = sortedContentKeys.slice(start, start + 400);
+          if (!keys.length) continue;
+          const placeholders = keys.map(() => "?").join(",");
+          const rows = db
+            .prepare(
+              `SELECT key, value FROM cursorDiskKV WHERE key IN (${placeholders})`,
+            )
+            .all(...keys) as Array<{ key: string; value: string }>;
+          rows
+            .sort((a, b) => a.key.localeCompare(b.key))
+            .forEach((row) =>
+              hash.update("\0").update(row.key).update("\0").update(row.value),
+            );
+        }
+
+        // A parent composer can turn this chat into a view-only subagent without
+        // changing this chat's own records.
+        const parents = db
+          .prepare(
+            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%' AND value LIKE ?",
+          )
+          .all(`%${chatId}%`) as Array<{ key: string; value: string }>;
+        parents
+          .sort((a, b) => a.key.localeCompare(b.key))
+          .forEach((row) =>
+            hash.update("\0").update(row.key).update("\0").update(row.value),
+          );
+      } catch {
+        // Hashing composer data still gives a stable fallback revision.
+      }
+      return hash.digest("hex");
+    } finally {
+      db.close();
+    }
+  }
 
   listProjects(): Project[] {
     const root = this.paths.workspaceStorage;
@@ -341,7 +495,14 @@ export class CursorStore {
     });
   }
 
-  getChat(chatId: string): ChatDetail | null {
+  getChat(chatId: string, knownRevision?: string): ChatDetail | null {
+    const revision = knownRevision || this.getChatRevision(chatId);
+    const cached = revision ? this.chatCache.get(chatId) : undefined;
+    if (cached && cached.revision === revision) {
+      this.chatCache.delete(chatId);
+      this.chatCache.set(chatId, cached);
+      return cached.detail;
+    }
     const globalDb = openReadonly(this.paths.globalDb);
     if (!globalDb) return null;
     try {
@@ -352,22 +513,39 @@ export class CursorStore {
       const data = JSON.parse(row.value) as ComposerData;
       const projectId = data.workspaceIdentifier?.id || "unknown";
       const headers = data.fullConversationHeadersOnly || [];
+      const readKvStmt = globalDb.prepare(
+        "SELECT value FROM cursorDiskKV WHERE key = ?",
+      );
       const readKv = (key: string): string | null => {
-        const r = globalDb
-          .prepare("SELECT value FROM cursorDiskKV WHERE key = ?")
-          .get(key) as { value: string } | undefined;
+        const r = readKvStmt.get(key) as { value: string } | undefined;
         return r?.value ?? null;
       };
 
+      // Fetch transcript bubbles in bounded batches rather than one SQL query
+      // per bubble. SQLite builds cap bound variables, hence chunks of 400.
+      const bubbleById = new Map<string, string>();
+      const bubbleKeys = headers.map(
+        (header) => `bubbleId:${chatId}:${header.bubbleId}`,
+      );
+      for (let start = 0; start < bubbleKeys.length; start += 400) {
+        const keys = bubbleKeys.slice(start, start + 400);
+        if (!keys.length) continue;
+        const placeholders = keys.map(() => "?").join(",");
+        const rows = globalDb
+          .prepare(
+            `SELECT key, value FROM cursorDiskKV WHERE key IN (${placeholders})`,
+          )
+          .all(...keys) as Array<{ key: string; value: string }>;
+        for (const bubbleRow of rows) {
+          bubbleById.set(bubbleRow.key, bubbleRow.value);
+        }
+      }
+
       const messages: ChatMessage[] = [];
       for (const h of headers) {
-        const bubbleRow = globalDb
-          .prepare("SELECT value FROM cursorDiskKV WHERE key = ?")
-          .get(`bubbleId:${chatId}:${h.bubbleId}`) as
-          | { value: string }
-          | undefined;
-        if (!bubbleRow) continue;
-        const bubble = JSON.parse(bubbleRow.value) as {
+        const bubbleValue = bubbleById.get(`bubbleId:${chatId}:${h.bubbleId}`);
+        if (!bubbleValue) continue;
+        const bubble = JSON.parse(bubbleValue) as {
           bubbleId?: string;
           type?: number;
           text?: string;
@@ -446,6 +624,10 @@ export class CursorStore {
               deletions?: number;
               exitCode?: number;
               output?: string;
+              durationMs?: number;
+              startedAt?: number;
+              finishedAt?: number;
+              statusKind?: "pending" | "running" | "completed" | "error" | "cancelled";
             }
           | undefined;
 
@@ -490,6 +672,45 @@ export class CursorStore {
           const status =
             tfd.status ||
             (typeof add.status === "string" ? add.status : undefined);
+          const numberField = (...keys: string[]): number | undefined => {
+            for (const key of keys) {
+              const value =
+                (tfd as Record<string, unknown>)[key] ?? add[key];
+              if (typeof value === "number" && Number.isFinite(value)) {
+                return value;
+              }
+              if (typeof value === "string" && value.trim()) {
+                const parsed = Number(value);
+                if (Number.isFinite(parsed)) return parsed;
+              }
+            }
+            return undefined;
+          };
+          const durationMs = numberField(
+            "durationMs",
+            "elapsedMs",
+            "executionTimeMs",
+          );
+          const startedAt = numberField("startedAt", "startTime", "startTimestamp");
+          const finishedAt = numberField(
+            "finishedAt",
+            "endTime",
+            "endTimestamp",
+          );
+          const statusKind = (() => {
+            const normalized = (status || "").toLowerCase();
+            if (/error|failed|failure/.test(normalized)) return "error" as const;
+            if (/cancel|abort|stopped/.test(normalized)) return "cancelled" as const;
+            if (/running|pending|started|progress/.test(normalized)) {
+              return normalized.includes("pending")
+                ? ("pending" as const)
+                : ("running" as const);
+            }
+            if (/complete|success|done|finished/.test(normalized)) {
+              return "completed" as const;
+            }
+            return undefined;
+          })();
 
           let diffPatch: string | undefined;
           let additions: number | undefined;
@@ -557,6 +778,10 @@ export class CursorStore {
             deletions,
             exitCode,
             output,
+            durationMs,
+            startedAt,
+            finishedAt,
+            statusKind,
           };
         }
 
@@ -613,8 +838,36 @@ export class CursorStore {
       const filesChanged = this.buildFilesChangedFromLatestTurn(withImages);
       const childIds = this.collectSubagentComposerIds();
       const messageable = this.isMessageableComposer(chatId, data, childIds);
+      const subagentIds = Array.from(
+        new Set([
+          ...(data.subagentComposerIds || []),
+          ...(data.subComposerIds || []),
+        ]),
+      ).filter(Boolean);
+      let parentChatId: string | undefined;
+      if (childIds.has(chatId)) {
+        const rows = globalDb
+          .prepare(
+            "SELECT key, value FROM cursorDiskKV WHERE key LIKE 'composerData:%' AND value LIKE ?",
+          )
+          .all(`%${chatId}%`) as Array<{ key: string; value: string }>;
+        for (const candidate of rows) {
+          try {
+            const parent = JSON.parse(candidate.value) as ComposerData;
+            const children = [
+              ...(parent.subagentComposerIds || []),
+              ...(parent.subComposerIds || []),
+            ];
+            if (!children.includes(chatId)) continue;
+            parentChatId = candidate.key.replace(/^composerData:/, "");
+            break;
+          } catch {
+            // Ignore malformed unrelated composer rows.
+          }
+        }
+      }
 
-      return {
+      const detail: ChatDetail = {
         id: chatId,
         projectId,
         name: data.name || "Untitled",
@@ -622,10 +875,25 @@ export class CursorStore {
         lastUpdatedAt: data.lastUpdatedAt,
         mode: data.unifiedMode,
         messageable,
+        isSubagent: childIds.has(chatId) || Boolean(data.isBestOfNSubcomposer),
+        parentChatId,
+        subagentIds: subagentIds.length ? subagentIds : undefined,
         messages: withImages,
         filesChangedCount: filesChanged.length || undefined,
         filesChanged,
       };
+      if (revision) {
+        this.chatCache.delete(chatId);
+        this.chatCache.set(chatId, { revision, detail });
+        while (this.chatCache.size > 8) {
+          const oldest = this.chatCache.keys().next().value as
+            | string
+            | undefined;
+          if (!oldest) break;
+          this.chatCache.delete(oldest);
+        }
+      }
+      return detail;
     } finally {
       globalDb.close();
     }
@@ -788,6 +1056,10 @@ export class CursorStore {
    * have no Composer input in Cursor — treat as view-only.
    */
   private collectSubagentComposerIds(): Set<string> {
+    const revision = this.globalDbRevision();
+    if (revision === this.subagentCacheKey) {
+      return new Set(this.subagentCache);
+    }
     const out = new Set<string>();
     const db = openReadonly(this.paths.globalDb);
     if (!db) return out;
@@ -813,7 +1085,9 @@ export class CursorStore {
     } finally {
       db.close();
     }
-    return out;
+    this.subagentCacheKey = revision;
+    this.subagentCache = out;
+    return new Set(out);
   }
 
   private isMessageableComposer(
@@ -852,6 +1126,19 @@ export class CursorStore {
     return list.map((c) => ({
       ...c,
       messageable: this.isMessageableComposer(c.id, dataById.get(c.id), childIds),
+      isSubagent:
+        childIds.has(c.id) ||
+        Boolean(dataById.get(c.id)?.isBestOfNSubcomposer),
+      subagentIds: (() => {
+        const data = dataById.get(c.id);
+        const ids = Array.from(
+          new Set([
+            ...(data?.subagentComposerIds || []),
+            ...(data?.subComposerIds || []),
+          ]),
+        ).filter(Boolean);
+        return ids.length ? ids : undefined;
+      })(),
     }));
   }
 

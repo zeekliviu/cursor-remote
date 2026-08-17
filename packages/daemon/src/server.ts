@@ -23,6 +23,7 @@ import { formatAttachmentsForPrompt, saveBase64Upload } from "./uploads.js";
 import { TerminalHub, ensurePtyPermissions } from "./terminal.js";
 import { activateCursorApp } from "./open-cursor.js";
 import { contentTypeForImage, isAllowedMediaPath } from "./media.js";
+import { ComposerMonitor } from "./composer-monitor.js";
 
 export type DaemonOptions = {
   port?: number;
@@ -58,6 +59,7 @@ export async function startDaemon(opts: DaemonOptions = {}): Promise<{
   const store = new CursorStore(paths);
   const selectors = loadSelectorPack("default");
   const cdp = new CdpDriver(cdpUrl, selectors);
+  const composerMonitor = new ComposerMonitor(cdp, store);
   ensurePtyPermissions();
   const terminals = new TerminalHub();
 
@@ -140,12 +142,26 @@ ${qrDataUrl ? `<p><img alt="pairing qr" src="${qrDataUrl}"/></p>` : ""}
   });
 
   app.get("/chats/:id", (req, res) => {
-    const chat = store.getChat(req.params.id);
-    if (!chat) {
+    let revision = store.getChatRevision(req.params.id);
+    if (!revision) {
       res.status(404).json({ error: "not found" });
       return;
     }
-    res.json(chat);
+    let chat = null;
+    for (let attempt = 0; attempt < 3 && revision; attempt += 1) {
+      const candidate = store.getChat(req.params.id, revision);
+      const after = store.getChatRevision(req.params.id);
+      if (candidate && after === revision) {
+        chat = candidate;
+        break;
+      }
+      revision = after;
+    }
+    if (!chat || !revision) {
+      res.status(503).json({ error: "chat is changing; retry" });
+      return;
+    }
+    res.json({ ...chat, revision });
   });
 
   app.get("/chats/:id/changed-file", (req, res) => {
@@ -254,6 +270,9 @@ ${qrDataUrl ? `<p><img alt="pairing qr" src="${qrDataUrl}"/></p>` : ""}
         switchIfNeeded: true,
         requireProjectMatch: false,
       });
+      if (result.chatSelected !== false && req.body?.chatId) {
+        composerMonitor.setActiveChat(String(req.body.chatId));
+      }
       res.json({
         window: result.window,
         chatSelected: result.chatSelected,
@@ -298,6 +317,7 @@ ${qrDataUrl ? `<p><img alt="pairing qr" src="${qrDataUrl}"/></p>` : ""}
   app.post("/composer/stop", async (_req, res) => {
     try {
       const ok = await cdp.stopGeneration();
+      composerMonitor.wake();
       res.json({ ok });
     } catch (err) {
       res.status(503).json({ error: (err as Error).message });
@@ -386,6 +406,8 @@ ${qrDataUrl ? `<p><img alt="pairing qr" src="${qrDataUrl}"/></p>` : ""}
         }
       }
       await cdp.sendMessage(full, req.body?.submit !== false);
+      if (chatId) composerMonitor.setActiveChat(chatId);
+      composerMonitor.wake();
       res.json({ ok: true });
     } catch (err) {
       res.status(503).json({ error: (err as Error).message });
@@ -479,6 +501,7 @@ ${qrDataUrl ? `<p><img alt="pairing qr" src="${qrDataUrl}"/></p>` : ""}
         choices: Object.keys(mergedChoices).length ? mergedChoices : undefined,
         toggles: Object.keys(mergedToggles).length ? mergedToggles : undefined,
       });
+      composerMonitor.wake();
       res.json({ ok });
     } catch (err) {
       res.status(503).json({ error: (err as Error).message });
@@ -515,6 +538,7 @@ ${qrDataUrl ? `<p><img alt="pairing qr" src="${qrDataUrl}"/></p>` : ""}
         String(req.body?.confirmationId || ""),
         String(req.body?.actionId || ""),
       );
+      composerMonitor.wake();
       res.json({ ok });
     } catch (err) {
       res.status(503).json({ error: (err as Error).message });
@@ -553,7 +577,7 @@ ${qrDataUrl ? `<p><img alt="pairing qr" src="${qrDataUrl}"/></p>` : ""}
         return;
       }
       if (url.pathname === "/composer") {
-        handleComposerWs(ws, cdp);
+        handleComposerWs(ws, cdp, composerMonitor);
         return;
       }
       ws.close(1008, "unknown path");
@@ -574,6 +598,8 @@ ${qrDataUrl ? `<p><img alt="pairing qr" src="${qrDataUrl}"/></p>` : ""}
     port,
     token: auth.token,
     close: async () => {
+      await composerMonitor.close();
+      terminals.close();
       await cdp.disconnect();
       await new Promise<void>((resolve, reject) => {
         server.close((err) => (err ? reject(err) : resolve()));
@@ -598,16 +624,12 @@ function buildPairing(bindHost: string, port: number, token: string): PairingInf
   };
 }
 
-function handleComposerWs(ws: WebSocket, cdp: CdpDriver): void {
-  let timer: NodeJS.Timeout | null = null;
-  let lastActivity = "\u0000";
-  let lastConfirmKey = "\u0000";
-
-  const stop = () => {
-    if (timer) clearInterval(timer);
-    timer = null;
-  };
-
+function handleComposerWs(
+  ws: WebSocket,
+  cdp: CdpDriver,
+  monitor: ComposerMonitor,
+): void {
+  monitor.attach(ws);
   ws.on("message", async (raw) => {
     let msg: ComposerClientMessage;
     try {
@@ -623,54 +645,26 @@ function handleComposerWs(ws: WebSocket, cdp: CdpDriver): void {
         return;
       }
       if (msg.type === "subscribe") {
-        if (msg.targetId) await cdp.selectWindow(msg.targetId);
-        sendComposer(ws, { type: "status", health: await cdp.health() });
-        stop();
-        lastActivity = "\u0000";
-        lastConfirmKey = "\u0000";
-        timer = setInterval(async () => {
-          try {
-            const event = await cdp.pollDomEvents();
-            if (event) {
-              sendComposer(ws, {
-                type: "event",
-                kind: event.kind,
-                text: event.text,
-                at: Date.now(),
-              });
-            }
-            const activity = await cdp.scrapeAgentActivity().catch(() => null);
-            if (activity) {
-              const key = `${activity.running ? 1 : 0}|${activity.status || ""}|${activity.currentModel || ""}`;
-              if (key !== lastActivity) {
-                lastActivity = key;
-                sendComposer(ws, {
-                  type: "activity",
-                  status: activity.status,
-                  currentModel: activity.currentModel,
-                  running: activity.running,
-                  at: Date.now(),
-                });
-              }
-            }
-            const items = await cdp.listConfirmations();
-            // Push transitions in both directions so clients can clear stale cards.
-            const confirmKey = items.map((i) => i.id).join(",");
-            if (confirmKey !== lastConfirmKey) {
-              lastConfirmKey = confirmKey;
-              sendComposer(ws, { type: "confirmations", items });
-            }
-          } catch (err) {
-            sendComposer(ws, {
-              type: "error",
-              message: (err as Error).message,
-            });
-          }
-        }, 1500);
+        sendComposer(ws, {
+          type: "capabilities",
+          chatDeltas: true,
+          typedApprovals: true,
+          turnComplete: true,
+        });
+        await monitor.subscribe(ws, msg.targetId);
+        return;
+      }
+      if (msg.type === "subscribeChat") {
+        await monitor.subscribeChat(ws, msg.chatId, msg.revision);
+        return;
+      }
+      if (msg.type === "unsubscribeChat") {
+        monitor.unsubscribeChat(ws, msg.chatId);
         return;
       }
       if (msg.type === "send") {
         await cdp.sendMessage(msg.text, msg.submit !== false);
+        monitor.wake();
         sendComposer(ws, {
           type: "event",
           kind: "sent",
@@ -682,6 +676,8 @@ function handleComposerWs(ws: WebSocket, cdp: CdpDriver): void {
       if (msg.type === "selectChat") {
         const name = msg.chatName || msg.chatId || "";
         const ok = await cdp.selectChatByName(name);
+        if (ok && msg.chatId) monitor.setActiveChat(msg.chatId);
+        monitor.wake();
         sendComposer(ws, {
           type: "event",
           kind: ok ? "chat_selected" : "chat_select_failed",
@@ -692,6 +688,7 @@ function handleComposerWs(ws: WebSocket, cdp: CdpDriver): void {
       }
       if (msg.type === "selectModel") {
         const ok = await cdp.selectModel(msg.modelLabel);
+        monitor.wake();
         sendComposer(ws, {
           type: "event",
           kind: ok ? "model_selected" : "model_select_failed",
@@ -705,6 +702,7 @@ function handleComposerWs(ws: WebSocket, cdp: CdpDriver): void {
           msg.confirmationId,
           msg.actionId,
         );
+        monitor.wake();
         sendComposer(ws, {
           type: "event",
           kind: ok ? "confirmation_acted" : "confirmation_failed",
@@ -716,5 +714,5 @@ function handleComposerWs(ws: WebSocket, cdp: CdpDriver): void {
     }
   });
 
-  ws.on("close", stop);
+  ws.on("close", () => monitor.detach(ws));
 }
