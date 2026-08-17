@@ -13,6 +13,9 @@ export type ChatSummary = {
   lastUpdatedAt?: number;
   mode?: string;
   isArchived?: boolean;
+  parentChatId?: string;
+  subagentIds?: string[];
+  isSubagent?: boolean;
   /**
    * False for subagent / explore transcripts (no Composer input in Cursor).
    * True for parent agent chats and normal composers you can message.
@@ -37,6 +40,10 @@ export type ChatMessage = {
     deletions?: number;
     exitCode?: number;
     output?: string;
+    durationMs?: number;
+    startedAt?: number;
+    finishedAt?: number;
+    statusKind?: "pending" | "running" | "completed" | "error" | "cancelled";
   };
   /** Assistant reasoning / "Thought for Ns" body */
   thinking?: string;
@@ -161,7 +168,17 @@ export type ConfirmationAction = {
   id: string;
   label: string;
   risk: "low" | "medium" | "high";
+  intent?: "deny" | "allowOnce" | "allowAlways" | "other";
 };
+
+export type ConfirmationKind =
+  | "shell"
+  | "network"
+  | "delete"
+  | "externalFile"
+  | "mcp"
+  | "browser"
+  | "generic";
 
 export type Confirmation = {
   id: string;
@@ -171,6 +188,10 @@ export type Confirmation = {
   summary?: string;
   /** Shell / tool command to approve */
   command?: string;
+  kind?: ConfirmationKind;
+  risk?: "low" | "medium" | "high";
+  /** Domain, path, MCP operation, or other protected resource. */
+  resource?: string;
   actions: ConfirmationAction[];
 };
 
@@ -183,13 +204,19 @@ export type PairingInfo = {
 };
 
 export type TerminalClientMessage =
-  | { type: "attach"; projectId: string; cols?: number; rows?: number }
+  | {
+      type: "attach";
+      projectId: string;
+      sessionId?: string;
+      cols?: number;
+      rows?: number;
+    }
   | { type: "input"; data: string }
   | { type: "resize"; cols: number; rows: number }
   | { type: "ping" };
 
 export type TerminalServerMessage =
-  | { type: "ready"; projectId: string; cwd: string }
+  | { type: "ready"; projectId: string; cwd: string; sessionId: string }
   | { type: "data"; data: string }
   | { type: "exit"; code: number | null }
   | { type: "error"; message: string }
@@ -197,18 +224,59 @@ export type TerminalServerMessage =
 
 export type ComposerClientMessage =
   | { type: "subscribe"; targetId?: string }
+  | { type: "subscribeChat"; chatId: string; revision?: string }
+  | { type: "unsubscribeChat"; chatId: string }
   | { type: "send"; text: string; submit?: boolean }
   | { type: "selectChat"; chatName?: string; chatId?: string }
   | { type: "selectModel"; modelLabel: string }
   | { type: "confirm"; confirmationId: string; actionId: string }
   | { type: "ping" };
 
+export type ChatDelta = {
+  chatId: string;
+  /** Revision the client must currently hold before applying this delta. */
+  baseRevision: string;
+  revision: string;
+  /** Replace the local message tail beginning at this index. */
+  fromIndex: number;
+  messages: ChatMessage[];
+  messageCount: number;
+  filesChangedCount?: number;
+  filesChanged?: ChatChangedFile[];
+  lastUpdatedAt?: number;
+};
+
 export type ComposerServerMessage =
+  | {
+      type: "capabilities";
+      chatDeltas: boolean;
+      typedApprovals?: boolean;
+      turnComplete?: boolean;
+    }
   | { type: "status"; health: ComposerHealth }
   | { type: "event"; kind: string; text?: string; at: number }
   | { type: "confirmations"; items: Confirmation[] }
   /** Host agent status line; `status` is undefined when the agent is idle. */
-  | { type: "activity"; status?: string; currentModel?: string; running?: boolean; at: number }
+  | {
+      type: "activity";
+      status?: string;
+      labels?: string[];
+      chatId?: string;
+      currentModel?: string;
+      running?: boolean;
+      startedAt?: number;
+      at: number;
+    }
+  | {
+      type: "turnComplete";
+      chatId?: string;
+      durationMs: number;
+      label?: string;
+      at: number;
+    }
+  | { type: "chatSnapshot"; chat: ChatDetail; revision: string; at: number }
+  | ({ type: "chatDelta"; at: number } & ChatDelta)
+  | { type: "chatError"; chatId: string; message: string; at: number }
   | { type: "error"; message: string }
   | { type: "pong" };
 
