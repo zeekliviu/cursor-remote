@@ -1,11 +1,17 @@
 import { useEffect, useRef } from "react";
 import { Animated, StyleSheet } from "react-native";
+import { useReducedMotion } from "./reduced-motion";
 
 /** Slow amber breath — "something is happening" without shouting. */
 export function PulseDot({ size = 7 }: { size?: number }) {
   const pulse = useRef(new Animated.Value(0.35)).current;
+  const reducedMotion = useReducedMotion();
 
   useEffect(() => {
+    if (reducedMotion) {
+      pulse.setValue(1);
+      return;
+    }
     const loop = Animated.loop(
       Animated.sequence([
         Animated.timing(pulse, {
@@ -22,7 +28,7 @@ export function PulseDot({ size = 7 }: { size?: number }) {
     );
     loop.start();
     return () => loop.stop();
-  }, [pulse]);
+  }, [pulse, reducedMotion]);
 
   return (
     <Animated.View

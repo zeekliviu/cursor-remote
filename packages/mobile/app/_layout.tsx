@@ -25,6 +25,10 @@ export default function RootLayout() {
             />
             <Stack.Screen name={"chats/[id]"} options={{ title: "Chat" }} />
             <Stack.Screen
+              name={"chats/[id]/changes"}
+              options={{ title: "Changes" }}
+            />
+            <Stack.Screen
               name={"terminal/[id]"}
               options={{ title: "Terminal" }}
             />

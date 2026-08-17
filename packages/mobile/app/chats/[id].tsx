@@ -1,5 +1,4 @@
 import {
-  type ReactNode,
   useCallback,
   useEffect,
   useLayoutEffect,
@@ -11,6 +10,7 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  FlatList,
   Image,
   Keyboard,
   KeyboardAvoidingView,
@@ -35,15 +35,15 @@ import * as Clipboard from "expo-clipboard";
 import * as Haptics from "expo-haptics";
 import type {
   AttachmentMeta,
-  ChatChangedFile,
   ChatDetail,
   ChatMessage,
-  ComposerHealth,
-  Confirmation,
 } from "@cursor-remote/shared";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useConnection } from "../../lib/connection";
-import { useComposerWatch } from "../../lib/composer-watch";
+import {
+  useChatWatch,
+  useComposerWatch,
+} from "../../lib/composer-watch";
 import {
   ModelPickerSheet,
   shortModelLabel,
@@ -54,18 +54,34 @@ import {
   rememberChat,
   setFocusedChat,
 } from "../../lib/focused-chat";
+import { useReducedMotion } from "../../lib/reduced-motion";
+import { ApprovalSheet } from "../../lib/approval-sheet";
 import {
-  buildChatBlocks,
-} from "../../lib/chat-blocks";
+  ImageViewer,
+  type ImageViewerImage,
+} from "../../lib/image-viewer";
 import {
-  formatToolGroupPreview,
-  formatToolMessage,
-  renderDiffLines,
-} from "../../lib/format-tool";
+  buildChatTurns,
+  getDefaultExpansionGuidance,
+  type ChatTurn,
+} from "../../lib/chat-turns";
+import {
+  CHAT_DENSITY_OPTIONS,
+  useChatDensity,
+  useChatExpansionState,
+} from "../../lib/chat-density";
+import { ToolCluster } from "../../lib/tool-cluster";
+import { WorkSummaryRow } from "../../lib/work-summary-row";
 
 const DRAFT_KEY = (chatId: string) => `cursor-remote:draft:${chatId}`;
 /** How close to the bottom still counts as "following the conversation". */
 const NEAR_BOTTOM_PX = 80;
+const SLASH_COMMANDS = [
+  { command: "/plan", label: "Plan first" },
+  { command: "/review", label: "Review changes" },
+  { command: "/fix", label: "Fix issue" },
+  { command: "/test", label: "Run tests" },
+];
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
@@ -107,9 +123,11 @@ type LocalAttach = {
 function MessageImages({
   images,
   mediaUrl,
+  onOpen,
 }: {
   images?: Array<{ path: string; name?: string; width?: number; height?: number }>;
   mediaUrl: (path: string) => string;
+  onOpen?: (index: number) => void;
 }) {
   if (!images?.length) return null;
   return (
@@ -119,14 +137,20 @@ function MessageImages({
       contentContainerStyle={styles.msgImageRowContent}
       showsHorizontalScrollIndicator={false}
     >
-      {images.map((img) => (
-        <Image
+      {images.map((img, index) => (
+        <Pressable
           key={img.path}
-          source={{ uri: mediaUrl(img.path) }}
-          style={styles.msgImage}
-          resizeMode="cover"
-          accessibilityLabel={img.name || "Attachment"}
-        />
+          onPress={() => onOpen?.(index)}
+          accessibilityRole="imagebutton"
+          accessibilityLabel={`Open ${img.name || "attachment"}`}
+        >
+          <Image
+            source={{ uri: mediaUrl(img.path), cache: "force-cache" }}
+            style={styles.msgImage}
+            resizeMode="cover"
+            accessibilityLabel={img.name || "Attachment"}
+          />
+        </Pressable>
       ))}
     </ScrollView>
   );
@@ -134,32 +158,14 @@ function MessageImages({
 
 function TypewriterText({
   text,
-  active,
   onLinkPress,
 }: {
   text: string;
-  active: boolean;
   onLinkPress?: (url: string) => boolean;
 }) {
-  const [shown, setShown] = useState(active ? "" : text);
-  useEffect(() => {
-    if (!active) {
-      setShown(text);
-      return;
-    }
-    setShown("");
-    let i = 0;
-    const step = Math.max(1, Math.floor(text.length / 80));
-    const id = setInterval(() => {
-      i = Math.min(text.length, i + step);
-      setShown(text.slice(0, i));
-      if (i >= text.length) clearInterval(id);
-    }, 16);
-    return () => clearInterval(id);
-  }, [text, active]);
   return (
     <Markdown style={markdownStyles} onLinkPress={onLinkPress}>
-      {shown || " "}
+      {text || " "}
     </Markdown>
   );
 }
@@ -176,9 +182,10 @@ function LiveStatusLine({
 }) {
   const pulse = useRef(new Animated.Value(1)).current;
   const running = Boolean(status);
+  const reducedMotion = useReducedMotion();
 
   useEffect(() => {
-    if (!running) {
+    if (!running || reducedMotion) {
       pulse.setValue(1);
       return;
     }
@@ -201,7 +208,7 @@ function LiveStatusLine({
       loop.stop();
       pulse.setValue(1);
     };
-  }, [pulse, running]);
+  }, [pulse, reducedMotion, running]);
 
   if (!status) return null;
 
@@ -217,58 +224,40 @@ function LiveStatusLine({
   );
 }
 
-/** Fade + lift used for approval cards so they never pop in abruptly. */
-function SoftEnter({
-  children,
-  style,
-}: {
-  children: ReactNode;
-  style?: object;
-}) {
-  const anim = useRef(new Animated.Value(0)).current;
-  useEffect(() => {
-    Animated.timing(anim, {
-      toValue: 1,
-      duration: 220,
-      useNativeDriver: true,
-    }).start();
-  }, [anim]);
-  return (
-    <Animated.View
-      style={[
-        style,
-        {
-          opacity: anim,
-          transform: [
-            {
-              translateY: anim.interpolate({
-                inputRange: [0, 1],
-                outputRange: [10, 0],
-              }),
-            },
-          ],
-        },
-      ]}
-    >
-      {children}
-    </Animated.View>
-  );
-}
-
 export default function ChatScreen() {
   const { id, projectId } = useLocalSearchParams<{
     id: string;
     projectId?: string;
   }>();
   const { client } = useConnection();
-  const { toast } = useComposerWatch();
+  const {
+    toast,
+    health,
+    confirmations,
+    hostStatus: agentStatus,
+    hostLabels,
+    hostStartedAt,
+    hostModel: hostModelLabel,
+  } = useComposerWatch();
+  const {
+    chats: watchedChats,
+    errors: chatErrors,
+    completions,
+    subscribeChat,
+    requestChatSnapshot,
+  } = useChatWatch();
   const navigation = useNavigation();
   const insets = useSafeAreaInsets();
-  const scrollRef = useRef<ScrollView>(null);
+  const scrollRef = useRef<FlatList<ChatTurn>>(null);
   const lastLenRef = useRef(0);
-  const streamingIdRef = useRef<string | null>(null);
   const nearBottomRef = useRef(true);
   const projectIdParam = typeof projectId === "string" ? projectId : undefined;
+  const hostId = client
+    ? client.connection.id ||
+      `${client.connection.host}:${client.connection.port}`
+    : null;
+  const { density, setDensity } = useChatDensity(hostId);
+  const turnExpansion = useChatExpansionState(hostId, id);
 
   const onMarkdownLink = useCallback(
     (url: string) => openSafeMarkdownUrl(url, { projectId: projectIdParam }),
@@ -284,47 +273,64 @@ export default function ChatScreen() {
   const [projectName, setProjectName] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
+  const [interrupting, setInterrupting] = useState(false);
   const [live, setLive] = useState("");
-  const [confirmations, setConfirmations] = useState<Confirmation[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [health, setHealth] = useState<ComposerHealth | null>(null);
-  const [expandedTools, setExpandedTools] = useState<Record<string, boolean>>(
-    {},
-  );
-  const [expandedThinking, setExpandedThinking] = useState<
-    Record<string, boolean>
-  >({});
-  const [expandedToolDetail, setExpandedToolDetail] = useState<
-    Record<string, boolean>
-  >({});
-  const [expandedChanged, setExpandedChanged] = useState(false);
-  const [changedPatches, setChangedPatches] = useState<
-    Record<string, ChatChangedFile>
-  >({});
-  const [loadingChanged, setLoadingChanged] = useState<string | null>(null);
-  const [agentStatus, setAgentStatus] = useState<string | null>(null);
-  const [hostModelLabel, setHostModelLabel] = useState<string | null>(null);
   const [modelOpen, setModelOpen] = useState(false);
+  const [approvalsOpen, setApprovalsOpen] = useState(false);
   const [kbHeight, setKbHeight] = useState(0);
   const [attaches, setAttaches] = useState<LocalAttach[]>([]);
-  const [streamingIds, setStreamingIds] = useState<Record<string, boolean>>({});
   const [bindHint, setBindHint] = useState<string | null>(null);
   const [atBottom, setAtBottom] = useState(true);
   const [newCount, setNewCount] = useState(0);
-
-  const blocks = useMemo(
-    () => (chat ? buildChatBlocks(chat.messages) : []),
-    [chat],
+  const [imageViewer, setImageViewer] = useState<{
+    images: ImageViewerImage[];
+    index: number;
+  } | null>(null);
+  const openMessageImages = useCallback(
+    (
+      images: Array<{ path: string; name?: string }>,
+      index: number,
+    ) => {
+      setImageViewer({
+        index,
+        images: images.map((image) => ({
+          uri: mediaUrlFor(image.path),
+          name: image.name,
+          accessibilityLabel: image.name || "Chat attachment",
+        })),
+      });
+    },
+    [mediaUrlFor],
   );
-  const cdpOk = Boolean(health?.cdpReachable);
-  const agentRunning = Boolean(agentStatus) || busy;
+
+  useEffect(() => {
+    if (!confirmations.length) setApprovalsOpen(false);
+  }, [confirmations.length]);
+
+  const turns = useMemo(() => {
+    const built = chat ? buildChatTurns(chat.messages) : [];
+    const completion = completions[id];
+    if (!completion || !built.length) return built;
+    return built.map((turn, index) =>
+      index === built.length - 1
+        ? {
+            ...turn,
+            durationMs: completion.durationMs,
+          }
+        : turn,
+    );
+  }, [chat, completions, id]);
+  const cdpOk = Boolean(health?.cdpReachable && health?.selectorsOk);
+  const hostAgentRunning = Boolean(agentStatus);
+  const agentRunning = hostAgentRunning || busy;
   const messageable = chat?.messageable !== false;
-  const showFilesChanged = Boolean(chat?.filesChanged?.length);
 
   const canSend =
     cdpOk &&
     messageable &&
-    !agentRunning &&
+    !busy &&
+    !interrupting &&
     (draft.trim().length > 0 || attaches.length > 0);
   const showJumpPill = !atBottom && (newCount > 0 || agentRunning);
 
@@ -370,18 +376,6 @@ export default function ChatScreen() {
       const prevLen = prev?.messages.length ?? 0;
       const nextLen = detail.messages.length;
       if (nextLen > prevLen) {
-        const newest = detail.messages[detail.messages.length - 1];
-        if (newest?.role === "assistant" && newest.text) {
-          streamingIdRef.current = newest.id;
-          setStreamingIds((s) => ({ ...s, [newest.id]: true }));
-          setTimeout(() => {
-            setStreamingIds((s) => {
-              const n = { ...s };
-              delete n[newest.id];
-              return n;
-            });
-          }, Math.min(4000, newest.text.length * 8));
-        }
         setTimeout(followBottom, 50);
       } else if (prev && nextLen === prevLen && nextLen > 0) {
         const a = prev.messages[prevLen - 1];
@@ -393,8 +387,6 @@ export default function ChatScreen() {
           b.role === "assistant" &&
           (b.text?.length || 0) > (a.text?.length || 0)
         ) {
-          streamingIdRef.current = b.id;
-          setStreamingIds((s) => ({ ...s, [b.id]: true }));
           setTimeout(followBottom, 30);
         }
       }
@@ -403,36 +395,16 @@ export default function ChatScreen() {
     });
   }, [followBottom]);
 
-  const refresh = useCallback(async (quiet = false) => {
-    if (!client || !id) return;
-    if (!quiet) setError(null);
-    try {
-      const [detail, h, activity, conf] = await Promise.all([
-        client.chat(id),
-        client.composerHealth().catch(() => null),
-        client.composerActivity().catch(() => null),
-        client.confirmations().catch(() => ({ items: [] as Confirmation[] })),
-      ]);
-      applyChatUpdate(detail);
-      setHealth(h);
-      setAgentStatus(
-        activity?.running === false
-          ? null
-          : activity?.status ||
-              (activity?.running ? "Working…" : null),
-      );
-      if (activity?.currentModel) {
-        setHostModelLabel(activity.currentModel);
-      }
-      setConfirmations(conf.items as Confirmation[]);
-    } catch (err) {
-      if (!quiet) setError((err as Error).message);
-    }
-  }, [applyChatUpdate, client, id]);
-
   useEffect(() => {
-    refresh(false);
-  }, [refresh]);
+    if (!id) return;
+    const watched = watchedChats[id];
+    if (chatErrors[id]) {
+      setError(chatErrors[id]);
+    } else if (watched) {
+      applyChatUpdate(watched.chat);
+      setError(null);
+    }
+  }, [applyChatUpdate, chatErrors, id, watchedChats]);
 
   useEffect(() => {
     if (!client || !projectId) {
@@ -466,6 +438,19 @@ export default function ChatScreen() {
   }, [projectName, messageable, chat?.messages.length]);
 
   const headerStatus = agentStatus || (busy ? live || "Working…" : null);
+  const openDensityMenu = useCallback(() => {
+    Alert.alert(
+      "Conversation density",
+      "Choose how much agent activity appears inline.",
+      [
+        ...CHAT_DENSITY_OPTIONS.map((option) => ({
+          text: `${option.label}${density === option.value ? " ✓" : ""}`,
+          onPress: () => setDensity(option.value),
+        })),
+        { text: "Cancel", style: "cancel" as const },
+      ],
+    );
+  }, [density, setDensity]);
 
   useLayoutEffect(() => {
     navigation.setOptions({
@@ -484,16 +469,39 @@ export default function ChatScreen() {
           ) : null}
         </View>
       ),
+      headerRight: () => (
+        <Pressable
+          onPress={openDensityMenu}
+          hitSlop={8}
+          accessibilityRole="button"
+          accessibilityLabel={`Conversation density: ${density}`}
+        >
+          <Text style={styles.densityButton}>{density.slice(0, 1).toUpperCase()}</Text>
+        </Pressable>
+      ),
     });
-  }, [navigation, headerSubtitle, headerStatus, chat?.name]);
+  }, [
+    navigation,
+    headerSubtitle,
+    headerStatus,
+    chat?.name,
+    density,
+    openDensityMenu,
+  ]);
 
   // Let the background watcher know this chat is on screen (no notification needed).
   useFocusEffect(
     useCallback(() => {
       if (!id) return;
       setFocusedChat({ id, projectId: projectIdParam });
-      return () => clearFocusedChat(id);
-    }, [id, projectIdParam]),
+      const unsubscribe = subscribeChat(id);
+      return () => {
+        unsubscribe();
+        clearFocusedChat(id);
+        lastLenRef.current = 0;
+        setChat(null);
+      };
+    }, [id, projectIdParam, subscribeChat]),
   );
 
   useEffect(() => {
@@ -535,18 +543,9 @@ export default function ChatScreen() {
     if (!id) return;
     const t = setTimeout(() => {
       AsyncStorage.setItem(DRAFT_KEY(id), draft).catch(() => undefined);
-    }, 200);
+    }, 500);
     return () => clearTimeout(t);
   }, [id, draft]);
-
-  // Realtime poll while chat is open
-  useEffect(() => {
-    if (!client || !id) return;
-    const t = setInterval(() => {
-      refresh(true);
-    }, 1200);
-    return () => clearInterval(t);
-  }, [client, id, refresh]);
 
   useEffect(() => {
     if (!client || !chat?.name) return;
@@ -590,6 +589,18 @@ export default function ChatScreen() {
       cancelled = true;
     };
   }, [client, chat?.name, projectId, id]);
+
+  useEffect(() => {
+    if (!bindHint || /failed|not found|error/i.test(bindHint)) return;
+    const timer = setTimeout(() => setBindHint(null), 3500);
+    return () => clearTimeout(timer);
+  }, [bindHint]);
+
+  useEffect(() => {
+    if (!/^(Sent|Queued in Cursor|Stop sent)$/.test(live)) return;
+    const timer = setTimeout(() => setLive(""), 2200);
+    return () => clearTimeout(timer);
+  }, [live]);
 
   async function pickPhoto() {
     const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
@@ -701,7 +712,7 @@ export default function ChatScreen() {
       setLive("Stopping…");
       await client.stopComposer();
       setLive("Stop sent");
-      await refresh(true);
+      requestChatSnapshot(id);
     } catch (err) {
       Alert.alert("Stop", (err as Error).message);
     }
@@ -761,13 +772,11 @@ export default function ChatScreen() {
           chatId: typeof id === "string" ? id : undefined,
         },
       );
-      setLive("Sent");
+      setLive(hostAgentRunning ? "Queued in Cursor" : "Sent");
       setDraft("");
       setAttaches([]);
       if (id) AsyncStorage.removeItem(DRAFT_KEY(id)).catch(() => undefined);
-      await refresh(true);
-      const conf = await client.confirmations().catch(() => ({ items: [] }));
-      setConfirmations(conf.items as Confirmation[]);
+      requestChatSnapshot(id);
       scrollBottom();
     } catch (err) {
       const msg = (err as Error).message || "send failed";
@@ -777,6 +786,247 @@ export default function ChatScreen() {
       setBusy(false);
     }
   }
+
+  async function interruptAndSend() {
+    if (!client || !hostAgentRunning || !canSend || interrupting || busy) return;
+    setInterrupting(true);
+    try {
+      setLive("Interrupting…");
+      const stopped = await client.stopComposer();
+      if (!stopped.ok) throw new Error("Cursor did not accept the stop request.");
+      let stillRunning = true;
+      for (let attempt = 0; attempt < 12; attempt += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        const activity = await client.composerActivity().catch(() => null);
+        if (
+          activity &&
+          (activity.running === false ||
+            (activity.running == null && !activity.status))
+        ) {
+          stillRunning = false;
+          break;
+        }
+      }
+      if (stillRunning) {
+        throw new Error("Cursor is still stopping. Try again in a moment.");
+      }
+      setInterrupting(false);
+      await send();
+    } catch (err) {
+      Alert.alert("Interrupt & send", (err as Error).message);
+    } finally {
+      setInterrupting(false);
+    }
+  }
+
+  const renderTurn = useCallback(
+    (turn: ChatTurn, index: number) => {
+      if (!chat) return null;
+      const isLatest = index === turns.length - 1;
+      const isActive = isLatest && hostAgentRunning;
+      const guidance = getDefaultExpansionGuidance(turn, {
+        density,
+        isActive,
+        completedTurnsAfter: Math.max(0, turns.length - index - 1),
+      });
+      const expanded = turnExpansion.isExpanded(
+        turn.id,
+        guidance.turnExpanded,
+      );
+      const latestFiles =
+        isLatest && chat.filesChanged?.length ? chat.filesChanged : [];
+      const fileCount = latestFiles.length || turn.stats.fileCount;
+      const additions = latestFiles.length
+        ? latestFiles.reduce((sum, file) => sum + (file.additions || 0), 0)
+        : turn.stats.additions;
+      const deletions = latestFiles.length
+        ? latestFiles.reduce((sum, file) => sum + (file.deletions || 0), 0)
+        : turn.stats.deletions;
+      return (
+        <View style={styles.turn}>
+          {turn.user ? (
+            <Pressable
+              onLongPress={() => copyOrQuote(turn.user!)}
+              delayLongPress={280}
+              style={({ pressed }) => [
+                styles.userBubble,
+                pressed && styles.bubblePressed,
+              ]}
+            >
+              <MessageImages
+                images={turn.user.images}
+                mediaUrl={mediaUrlFor}
+                onOpen={(imageIndex) =>
+                  openMessageImages(turn.user?.images || [], imageIndex)
+                }
+              />
+              {turn.user.text ? (
+                <Markdown
+                  style={markdownStyles}
+                  onLinkPress={onMarkdownLink}
+                >
+                  {turn.user.text}
+                </Markdown>
+              ) : null}
+            </Pressable>
+          ) : null}
+
+          {(turn.toolMessages.length > 0 ||
+            turn.thinking.length > 0 ||
+            isActive) ? (
+            <WorkSummaryRow
+              active={isActive}
+              status={isActive ? agentStatus || hostLabels[0] : null}
+              startedAt={isActive ? hostStartedAt : null}
+              durationMs={turn.durationMs}
+              toolCount={turn.stats.toolCount}
+              fileCount={fileCount}
+              additions={additions}
+              deletions={deletions}
+              expanded={expanded}
+              onToggle={() =>
+                turnExpansion.toggleExpanded(turn.id, guidance.turnExpanded)
+              }
+              onOpenChanges={
+                latestFiles.length
+                  ? () => router.push(`/chats/${id}/changes`)
+                  : undefined
+              }
+            />
+          ) : null}
+
+          <View style={styles.turnWork}>
+            {turn.timeline.map((item) => {
+              if (item.kind === "assistant") {
+                const message = item.message;
+                if (
+                  density === "compact" &&
+                  turn.finalAssistant?.id !== message.id
+                ) {
+                  return null;
+                }
+                return (
+                  <Pressable
+                    key={item.id}
+                    onLongPress={() => copyOrQuote(message)}
+                    delayLongPress={280}
+                    style={({ pressed }) => [
+                      styles.assistantMessage,
+                      pressed && styles.bubblePressed,
+                    ]}
+                  >
+                    <MessageImages
+                      images={message.images}
+                      mediaUrl={mediaUrlFor}
+                      onOpen={(imageIndex) =>
+                        openMessageImages(message.images || [], imageIndex)
+                      }
+                    />
+                    {message.text ? (
+                      <TypewriterText
+                        text={message.text}
+                        onLinkPress={onMarkdownLink}
+                      />
+                    ) : null}
+                  </Pressable>
+                );
+              }
+
+              if (item.kind === "thinking") {
+                if (!expanded) return null;
+                const entry = item.entry;
+                const thinkingOpen = turnExpansion.isExpanded(
+                  entry.id,
+                  guidance.thinkingExpanded,
+                );
+                return (
+                  <View key={item.id} style={styles.thinkingCompact}>
+                    <Pressable
+                      onPress={() =>
+                        turnExpansion.toggleExpanded(
+                          entry.id,
+                          guidance.thinkingExpanded,
+                        )
+                      }
+                      style={styles.thinkingCompactHeader}
+                      accessibilityRole="button"
+                      accessibilityState={{ expanded: thinkingOpen }}
+                    >
+                      <Text style={styles.thinkingCompactTitle}>
+                        {thinkingOpen ? "⌄" : "›"}{" "}
+                        {entry.durationMs
+                          ? `Thought for ${Math.max(
+                              1,
+                              Math.round(entry.durationMs / 1000),
+                            )}s`
+                          : "Thinking"}
+                      </Text>
+                    </Pressable>
+                    {thinkingOpen ? (
+                      <Text selectable style={styles.thinkingCompactBody}>
+                        {entry.text}
+                      </Text>
+                    ) : null}
+                  </View>
+                );
+              }
+
+              if (item.kind === "tools") {
+                if (!expanded) return null;
+                const cluster = item.cluster;
+                return (
+                  <ToolCluster
+                    key={item.id}
+                    clusterId={cluster.id}
+                    category={cluster.category}
+                    messages={cluster.messages}
+                    density={density}
+                    initiallyExpanded={guidance.expandedToolClusterIds.includes(
+                      cluster.id,
+                    )}
+                    isExpanded={turnExpansion.isExpanded}
+                    onToggleExpanded={turnExpansion.toggleExpanded}
+                    onOpenTerminal={() =>
+                      router.push(
+                        `/terminal/${projectIdParam || chat.projectId}`,
+                      )
+                    }
+                    onQuickPrompt={(prompt) => setDraft(prompt)}
+                  />
+                );
+              }
+
+              const important = /task finished|background task|subagent/i.test(
+                item.message.text,
+              );
+              if (!expanded && !important) return null;
+              if (density !== "detailed" && !important) return null;
+              return (
+                <View key={item.id} style={styles.systemRow}>
+                  <Text style={styles.systemText}>{item.message.text}</Text>
+                </View>
+              );
+            })}
+          </View>
+        </View>
+      );
+    },
+    [
+      agentStatus,
+      chat,
+      density,
+      hostAgentRunning,
+      hostLabels,
+      hostStartedAt,
+      id,
+      mediaUrlFor,
+      onMarkdownLink,
+      openMessageImages,
+      projectIdParam,
+      turnExpansion,
+      turns.length,
+    ],
+  );
 
   if (!client) {
     return (
@@ -800,299 +1050,64 @@ export default function ChatScreen() {
       behavior={Platform.OS === "ios" ? "padding" : undefined}
       keyboardVerticalOffset={Platform.OS === "ios" ? 108 : 0}
     >
-      <ScrollView
+      <FlatList
         ref={scrollRef}
+        data={turns}
+        keyExtractor={(turn) => turn.id}
+        renderItem={({ item, index }) => renderTurn(item, index)}
         contentContainerStyle={styles.container}
         onContentSizeChange={followBottom}
         onScroll={onScroll}
-        scrollEventThrottle={16}
+        scrollEventThrottle={32}
+        removeClippedSubviews={Platform.OS === "android"}
         keyboardShouldPersistTaps="handled"
-      >
-        {!messageable ? (
-          <View style={styles.readonlyBanner}>
-            <Text style={styles.readonlyTitle}>View only</Text>
-            <Text style={styles.readonlyBody}>
-              This is a subagent / explore transcript. Cursor has no Composer
-              input here — open a parent agent chat to send messages.
-            </Text>
-          </View>
-        ) : null}
-        {!cdpOk ? (
-          <View style={styles.warn}>
-            <Text style={styles.warnTitle}>CDP down — Send is blocked</Text>
-            <Text style={styles.warnBody}>
-              {health?.fixHint ||
-                "On the Mac: quit Cursor, then run ./scripts/launch-cursor-debug.sh"}
-            </Text>
-          </View>
-        ) : null}
-        {error ? <Text style={styles.error}>{error}</Text> : null}
-        {live ? <Text style={styles.live}>{live}</Text> : null}
-        {bindHint ? <Text style={styles.bindHint}>{bindHint}</Text> : null}
-        {blocks.map((block) => {
-          if (block.kind === "thinking") {
-            const m = block.message;
-            const open = !!expandedThinking[block.id];
-            return (
-              <View key={block.id} style={styles.thinkingGroup}>
-                <Pressable
-                  onPress={() =>
-                    setExpandedThinking((s) => ({
-                      ...s,
-                      [block.id]: !open,
-                    }))
-                  }
-                  style={styles.thinkingHeader}
-                >
-                  <Text style={styles.thinkingHeaderText}>
-                    {open ? "▼" : "▶"} {m.text || "Thinking…"}
-                  </Text>
-                </Pressable>
-                {open && m.thinking ? (
-                  <Text style={styles.thinkingBody} selectable>
-                    {m.thinking}
-                  </Text>
+        initialNumToRender={6}
+        maxToRenderPerBatch={6}
+        windowSize={7}
+        ListHeaderComponent={
+          <View style={styles.listHeader}>
+            {!messageable ? (
+              <View style={styles.readonlyBanner}>
+                <Text style={styles.readonlyTitle}>View only</Text>
+                <Text style={styles.readonlyBody}>
+                  This is a subagent / explore transcript. Cursor has no
+                  Composer input here — open a parent agent chat to send
+                  messages.
+                </Text>
+                {chat.parentChatId ? (
+                  <Pressable
+                    onPress={() =>
+                      router.push(
+                        `/chats/${chat.parentChatId}?projectId=${projectIdParam || chat.projectId}`,
+                      )
+                    }
+                    accessibilityRole="button"
+                  >
+                    <Text style={styles.readonlyLink}>Open parent chat ›</Text>
+                  </Pressable>
                 ) : null}
               </View>
-            );
-          }
-          if (block.kind === "tools") {
-            const open = !!expandedTools[block.id];
-            return (
-              <View key={block.id} style={styles.toolGroup}>
-                <Pressable
-                  onPress={() =>
-                    setExpandedTools((s) => ({
-                      ...s,
-                      [block.id]: !open,
-                    }))
-                  }
-                  style={styles.toolHeader}
-                >
-                  <Text style={styles.toolHeaderText}>
-                    {open ? "▼" : "▶"} {block.count} action
-                    {block.count === 1 ? "" : "s"}
-                  </Text>
-                </Pressable>
-                {open ? (
-                  block.messages.map((m) => {
-                    const fmt = formatToolMessage(m);
-                    const detailOpen = !!expandedToolDetail[m.id];
-                    const hasExtra = Boolean(
-                      fmt.diffPatch || fmt.output || fmt.exitCode != null,
-                    );
-                    return (
-                      <Pressable
-                        key={m.id}
-                        style={styles.toolDetail}
-                        onPress={() =>
-                          hasExtra &&
-                          setExpandedToolDetail((s) => ({
-                            ...s,
-                            [m.id]: !detailOpen,
-                          }))
-                        }
-                      >
-                        <Text style={styles.toolName}>
-                          {fmt.title}
-                          {fmt.status ? (
-                            <Text style={styles.toolStatus}> · {fmt.status}</Text>
-                          ) : null}
-                        </Text>
-                        {fmt.detail ? (
-                          <Text style={styles.toolDetailText} selectable>
-                            {fmt.detail}
-                          </Text>
-                        ) : null}
-                        {fmt.result ? (
-                          <Text style={styles.toolResult} selectable>
-                            → {fmt.result}
-                          </Text>
-                        ) : null}
-                        {(fmt.additions != null || fmt.deletions != null) &&
-                        !fmt.result?.includes("+") ? (
-                          <Text style={styles.diffStats}>
-                            <Text style={styles.diffAdd}>
-                              +{fmt.additions ?? 0}
-                            </Text>{" "}
-                            <Text style={styles.diffDel}>
-                              −{fmt.deletions ?? 0}
-                            </Text>
-                          </Text>
-                        ) : null}
-                        {detailOpen && fmt.diffPatch ? (
-                          <View style={styles.diffBox}>
-                            {renderDiffLines(fmt.diffPatch).map((line, i) => (
-                              <Text
-                                key={`${m.id}-d-${i}`}
-                                style={[
-                                  styles.diffLine,
-                                  line.kind === "add" && styles.diffLineAdd,
-                                  line.kind === "del" && styles.diffLineDel,
-                                  line.kind === "meta" && styles.diffLineMeta,
-                                ]}
-                                selectable
-                              >
-                                {line.t}
-                              </Text>
-                            ))}
-                          </View>
-                        ) : null}
-                        {detailOpen && fmt.output ? (
-                          <Text style={styles.termOut} selectable>
-                            {fmt.exitCode != null
-                              ? `$ exit ${fmt.exitCode}\n`
-                              : ""}
-                            {fmt.output}
-                          </Text>
-                        ) : null}
-                        {hasExtra && !detailOpen ? (
-                          <Text style={styles.tapHint}>Tap for details</Text>
-                        ) : null}
-                      </Pressable>
-                    );
-                  })
-                ) : (
-                  <Text style={styles.toolPreview} numberOfLines={2}>
-                    {formatToolGroupPreview(block.messages)}
-                  </Text>
-                )}
+            ) : null}
+            {!cdpOk ? (
+              <View style={styles.warn}>
+                <Text style={styles.warnTitle}>
+                  CDP down — Send is blocked
+                </Text>
+                <Text style={styles.warnBody}>
+                  {health?.fixHint ||
+                    "On the Mac: quit Cursor, then run ./scripts/launch-cursor-debug.sh"}
+                </Text>
               </View>
-            );
-          }
-          const m = block.message;
-          const animate = !!streamingIds[m.id];
-          if (m.role === "system") {
-            return (
-              <View key={m.id} style={styles.systemBubble}>
-                <Text style={styles.systemText}>{m.text}</Text>
-              </View>
-            );
-          }
-          return (
-            <Pressable
-              key={m.id}
-              onLongPress={() => copyOrQuote(m)}
-              delayLongPress={280}
-              style={({ pressed }) => [
-                styles.bubble,
-                m.role === "user" ? styles.user : styles.assistant,
-                pressed && styles.bubblePressed,
-              ]}
-            >
-              <Text style={styles.role}>{m.role}</Text>
-              <MessageImages images={m.images} mediaUrl={mediaUrlFor} />
-              {m.role === "assistant" ? (
-                m.text ? (
-                  <TypewriterText
-                    text={m.text}
-                    active={animate}
-                    onLinkPress={onMarkdownLink}
-                  />
-                ) : null
-              ) : m.role === "user" ? (
-                m.text ? (
-                  <Markdown
-                    style={markdownStyles}
-                    onLinkPress={onMarkdownLink}
-                  >
-                    {m.text}
-                  </Markdown>
-                ) : null
-              ) : (
-                <Text style={styles.bubbleText}>{m.text}</Text>
-              )}
-            </Pressable>
-          );
-        })}
-        {(showFilesChanged && (chat.filesChanged?.length || 0) > 0) ? (
-          <View style={styles.filesChanged}>
-            <Pressable
-              onPress={() => setExpandedChanged((v) => !v)}
-              style={styles.filesChangedHeader}
-            >
-              <Text style={styles.filesChangedTitle}>
-                {expandedChanged ? "▼" : "▶"}{" "}
-                {chat.filesChangedCount || chat.filesChanged?.length || 0}{" "}
-                Files Changed
-              </Text>
-            </Pressable>
-            {expandedChanged
-              ? (chat.filesChanged || []).map((f) => {
-                  const loaded = changedPatches[f.path];
-                  const open = !!loaded;
-                  return (
-                    <View key={f.path} style={styles.changedRow}>
-                      <Pressable
-                        onPress={async () => {
-                          if (open) {
-                            setChangedPatches((s) => {
-                              const n = { ...s };
-                              delete n[f.path];
-                              return n;
-                            });
-                            return;
-                          }
-                          if (!client || !id) return;
-                          setLoadingChanged(f.path);
-                          try {
-                            const full = await client.changedFile(id, f.path);
-                            setChangedPatches((s) => ({
-                              ...s,
-                              [f.path]: full,
-                            }));
-                          } catch (err) {
-                            Alert.alert("Diff", (err as Error).message);
-                          } finally {
-                            setLoadingChanged(null);
-                          }
-                        }}
-                      >
-                        <Text style={styles.changedPath} numberOfLines={2}>
-                          {f.isNew ? "A " : "M "}
-                          {f.path.replace(/^.*\/(?=[^/]+\/[^/]+$)/, "")}
-                        </Text>
-                        {loadingChanged === f.path ? (
-                          <ActivityIndicator size="small" />
-                        ) : null}
-                      </Pressable>
-                      {open && loaded?.patch ? (
-                        <View style={styles.diffBox}>
-                          {(loaded.additions != null ||
-                            loaded.deletions != null) && (
-                            <Text style={styles.diffStats}>
-                              <Text style={styles.diffAdd}>
-                                +{loaded.additions ?? 0}
-                              </Text>{" "}
-                              <Text style={styles.diffDel}>
-                                −{loaded.deletions ?? 0}
-                              </Text>
-                            </Text>
-                          )}
-                          {renderDiffLines(loaded.patch).map((line, i) => (
-                            <Text
-                              key={`${f.path}-${i}`}
-                              style={[
-                                styles.diffLine,
-                                line.kind === "add" && styles.diffLineAdd,
-                                line.kind === "del" && styles.diffLineDel,
-                                line.kind === "meta" && styles.diffLineMeta,
-                              ]}
-                              selectable
-                            >
-                              {line.t}
-                            </Text>
-                          ))}
-                        </View>
-                      ) : null}
-                    </View>
-                  );
-                })
-              : null}
+            ) : null}
+            {error ? <Text style={styles.error}>{error}</Text> : null}
+            {live ? <Text style={styles.live}>{live}</Text> : null}
+            {bindHint ? <Text style={styles.bindHint}>{bindHint}</Text> : null}
           </View>
-        ) : null}
-        <View onLayout={followBottom} style={{ height: 1 }} />
-      </ScrollView>
+        }
+        ListFooterComponent={
+          <View onLayout={followBottom} style={{ height: 1 }} />
+        }
+      />
 
       <View
         style={[
@@ -1127,113 +1142,26 @@ export default function ChatScreen() {
           </Pressable>
         ) : null}
         {confirmations.length > 0 ? (
-          <View style={styles.confirmStack}>
-            {confirmations
-              .filter((c) => {
-                const t = (c.text || "")
-                  .replace(/[↵⏎]/g, "")
-                  .replace(/\s+/g, " ")
-                  .trim();
-                // Drop scrapes that are only button labels (legacy daemon / nested parents).
-                if (
-                  /^(skip|run|allow|cancel|reject|deny|yes|no)(\s+(skip|run|allow|cancel|reject|deny|yes|no))*$/i.test(
-                    t,
-                  )
-                ) {
-                  return false;
-                }
-                return t.length >= 4;
-              })
-              .map((c) => {
-              const runLike = c.actions.filter((a) =>
-                /^(run|allow|accept|approve|continue|confirm|yes)$/i.test(
-                  a.label,
-                ),
-              );
-              const cancelLike = c.actions.filter((a) =>
-                /^(cancel|skip|reject|deny|no)$/i.test(a.label),
-              );
-              const other = c.actions.filter(
-                (a) =>
-                  !runLike.some((x) => x.id === a.id) &&
-                  !cancelLike.some((x) => x.id === a.id),
-              );
-              const ordered = [...runLike, ...other, ...cancelLike];
-              return (
-                <SoftEnter key={c.id} style={styles.confirm}>
-                  <Text style={styles.confirmBadge}>Needs approval</Text>
-                  <Text style={styles.confirmTitle}>
-                    {c.text
-                      .replace(/[↵⏎]/g, "")
-                      .replace(
-                        /\s+(Skip|Run|Allow|Cancel|Reject|Deny)(\s+(Skip|Run|Allow|Cancel|Reject|Deny))*\s*$/i,
-                        "",
-                      )
-                      .trim()}
-                  </Text>
-                  {c.summary ? (
-                    <Text style={styles.confirmSummary} selectable>
-                      {c.summary}
-                    </Text>
-                  ) : null}
-                  {c.command ? (
-                    <View style={styles.confirmCommandBox}>
-                      <Text style={styles.confirmCommandLabel}>Command</Text>
-                      <Text style={styles.confirmCommand} selectable>
-                        {c.command}
-                      </Text>
-                    </View>
-                  ) : null}
-                  <View style={styles.confirmActions}>
-                    {ordered.map((a) => {
-                      const isRun =
-                        /^(run|allow|accept|approve|continue|confirm|yes)$/i.test(
-                          a.label,
-                        );
-                      const isCancel = /^(cancel|skip|reject|deny|no)$/i.test(
-                        a.label,
-                      );
-                      return (
-                        <Pressable
-                          key={a.id}
-                          style={({ pressed }) => [
-                            styles.confirmBtn,
-                            isRun && styles.confirmBtnRun,
-                            isCancel && styles.confirmBtnCancel,
-                            a.risk === "high" &&
-                              isRun &&
-                              styles.confirmBtnHigh,
-                            pressed && styles.pressedSoft,
-                          ]}
-                          onPress={async () => {
-                            void Haptics.selectionAsync().catch(
-                              () => undefined,
-                            );
-                            try {
-                              await client.actConfirmation(c.id, a.id);
-                              setConfirmations([]);
-                              refresh(true);
-                            } catch (err) {
-                              Alert.alert("Approval", (err as Error).message);
-                            }
-                          }}
-                        >
-                          <Text
-                            style={[
-                              styles.confirmBtnText,
-                              (isRun || isCancel) && styles.confirmBtnTextOn,
-                            ]}
-                          >
-                            {a.label}
-                          </Text>
-                        </Pressable>
-                      );
-                    })}
-                  </View>
-                </SoftEnter>
-              );
-            })}
-          </View>
+          <Pressable
+            style={({ pressed }) => [
+              styles.approvalDock,
+              pressed && styles.pressedSoft,
+            ]}
+            onPress={() => setApprovalsOpen(true)}
+            accessibilityRole="button"
+            accessibilityLabel={`${confirmations.length} approval ${confirmations.length === 1 ? "request" : "requests"}`}
+          >
+            <View style={styles.approvalDockCopy}>
+              <Text style={styles.approvalDockBadge}>Needs approval</Text>
+              <Text style={styles.approvalDockTitle} numberOfLines={1}>
+                {confirmations[0]?.text || "Agent is waiting for you"}
+              </Text>
+            </View>
+            <Text style={styles.approvalDockAction}>
+              {confirmations.length > 1 ? `${confirmations.length} · ` : ""}
+              Review ›
+            </Text>
+          </Pressable>
         ) : null}
         {!messageable ? (
           <Text style={styles.composerReadonlyHint}>
@@ -1262,6 +1190,28 @@ export default function ChatScreen() {
           </ScrollView>
         ) : null}
 
+        {draft.startsWith("/") && !draft.includes(" ") ? (
+          <ScrollView
+            horizontal
+            showsHorizontalScrollIndicator={false}
+            contentContainerStyle={styles.slashRow}
+          >
+            {SLASH_COMMANDS.filter(({ command }) =>
+              command.startsWith(draft.toLowerCase()),
+            ).map(({ command, label }) => (
+              <Pressable
+                key={command}
+                style={styles.slashChip}
+                onPress={() => setDraft(`${command} `)}
+                accessibilityRole="button"
+              >
+                <Text style={styles.slashCommand}>{command}</Text>
+                <Text style={styles.slashLabel}>{label}</Text>
+              </Pressable>
+            ))}
+          </ScrollView>
+        ) : null}
+
         <View style={styles.inputRow}>
           <Pressable
             style={({ pressed }) => [
@@ -1280,6 +1230,9 @@ export default function ChatScreen() {
               pressed && styles.pressedSoft,
             ]}
             onPress={() => setModelOpen(true)}
+            onLongPress={() =>
+              Alert.alert("Active model", hostModelLabel || "Auto")
+            }
             accessibilityLabel="Change model"
           >
             <Text style={styles.modelChipText} numberOfLines={1}>
@@ -1292,35 +1245,70 @@ export default function ChatScreen() {
             multiline
             value={draft}
             onChangeText={setDraft}
-            editable={cdpOk && !agentRunning}
+            editable={cdpOk && !busy && !interrupting}
           />
+          {hostAgentRunning ? (
+            <Pressable
+              style={({ pressed }) => [
+                styles.actionOrb,
+                styles.actionOrbStop,
+                pressed && styles.actionOrbPressed,
+              ]}
+              onPress={() => {
+                void Haptics.impactAsync(
+                  Haptics.ImpactFeedbackStyle.Medium,
+                ).catch(() => undefined);
+                void stopAgent();
+              }}
+              disabled={interrupting}
+              accessibilityLabel="Stop agent"
+              accessibilityState={{ disabled: interrupting, busy: interrupting }}
+            >
+              <Text style={[styles.actionOrbIcon, styles.actionOrbIconStop]}>
+                ■
+              </Text>
+            </Pressable>
+          ) : null}
           <Pressable
             style={({ pressed }) => [
               styles.actionOrb,
-              agentRunning && styles.actionOrbStop,
-              !agentRunning && !canSend && styles.actionOrbDisabled,
+              !canSend && styles.actionOrbDisabled,
               pressed && styles.actionOrbPressed,
             ]}
-            disabled={!cdpOk || (!agentRunning && !canSend)}
+            disabled={!canSend}
             onPress={() => {
               void Haptics.impactAsync(
-                agentRunning
-                  ? Haptics.ImpactFeedbackStyle.Medium
-                  : Haptics.ImpactFeedbackStyle.Light,
+                Haptics.ImpactFeedbackStyle.Light,
               ).catch(() => undefined);
-              if (agentRunning) void stopAgent();
-              else void send();
+              void send();
             }}
-            accessibilityLabel={agentRunning ? "Stop agent" : "Send message"}
+            onLongPress={() => {
+              if (!hostAgentRunning || !canSend) return;
+              Alert.alert(
+                "Send while agent is working",
+                "Queue this follow-up in Cursor, or interrupt the current step first?",
+                [
+                  { text: "Cancel", style: "cancel" },
+                  { text: "Queue", onPress: () => void send() },
+                  {
+                    text: "Interrupt & send",
+                    style: "destructive",
+                    onPress: () => void interruptAndSend(),
+                  },
+                ],
+              );
+            }}
+            accessibilityLabel={
+              hostAgentRunning ? "Queue message" : "Send message"
+            }
           >
             <Text
               style={[
                 styles.actionOrbIcon,
-                agentRunning && styles.actionOrbIconStop,
-                !agentRunning && !canSend && styles.actionOrbIconDisabled,
+                !canSend && styles.actionOrbIconDisabled,
               ]}
             >
-              {agentRunning ? "■" : "✈"}
+              {hostAgentRunning ? "↥" : "✈"}
             </Text>
           </Pressable>
         </View>
@@ -1328,16 +1316,33 @@ export default function ChatScreen() {
         )}
       </View>
 
+      <ImageViewer
+        visible={Boolean(imageViewer)}
+        images={imageViewer?.images || []}
+        initialIndex={imageViewer?.index || 0}
+        onClose={() => setImageViewer(null)}
+      />
+
+      <ApprovalSheet
+        open={approvalsOpen}
+        confirmations={confirmations}
+        onClose={() => setApprovalsOpen(false)}
+        onAction={async (confirmationId, actionId) => {
+          const result = await client.actConfirmation(
+            confirmationId,
+            actionId,
+          );
+          if (!result.ok) throw new Error("Cursor did not accept this action.");
+          return result;
+        }}
+      />
+
       <ModelPickerSheet
         open={modelOpen}
         hostModelLabel={hostModelLabel}
         cdpOk={cdpOk}
         onClose={() => setModelOpen(false)}
-        onApplied={(label) => {
-          // Show it straight away; the activity poll confirms within a tick.
-          setHostModelLabel(label);
-          setModelOpen(false);
-        }}
+        onApplied={() => setModelOpen(false)}
       />
     </KeyboardAvoidingView>
   );
@@ -1418,6 +1423,60 @@ const styles = StyleSheet.create({
     lineHeight: 14,
   },
   container: { padding: 16, gap: 10, paddingBottom: 24 },
+  listHeader: { gap: 8 },
+  densityButton: {
+    color: "#5f584e",
+    fontSize: 12,
+    fontWeight: "800",
+    width: 32,
+    height: 32,
+    lineHeight: 32,
+    textAlign: "center",
+    borderRadius: 16,
+    backgroundColor: "#ebe4d6",
+    overflow: "hidden",
+  },
+  turn: { gap: 5, marginBottom: 12 },
+  turnWork: { gap: 3 },
+  userBubble: {
+    alignSelf: "flex-end",
+    maxWidth: "92%",
+    borderRadius: 15,
+    borderBottomRightRadius: 5,
+    backgroundColor: "#ebe4d6",
+    paddingHorizontal: 12,
+    paddingVertical: 9,
+  },
+  assistantMessage: {
+    alignSelf: "stretch",
+    paddingHorizontal: 2,
+    paddingVertical: 5,
+  },
+  thinkingCompact: {
+    borderLeftWidth: 2,
+    borderLeftColor: "#d8d0c2",
+    paddingLeft: 9,
+    marginVertical: 2,
+  },
+  thinkingCompactHeader: { minHeight: 36, justifyContent: "center" },
+  thinkingCompactTitle: {
+    color: "#736b60",
+    fontSize: 12,
+    fontStyle: "italic",
+    fontWeight: "700",
+  },
+  thinkingCompactBody: {
+    color: "#5f584f",
+    fontSize: 12,
+    lineHeight: 18,
+    paddingBottom: 8,
+  },
+  systemRow: {
+    backgroundColor: "#efebe3",
+    borderRadius: 9,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
   meta: { color: "#6f685c", marginBottom: 6 },
   bubble: {
     borderRadius: 14,
@@ -1537,7 +1596,7 @@ const styles = StyleSheet.create({
   },
   chipText: { color: "#f7f4ee", fontWeight: "600", fontSize: 13 },
   modelChip: {
-    maxWidth: 88,
+    maxWidth: 112,
     height: 42,
     paddingHorizontal: 10,
     borderRadius: 21,
@@ -1609,6 +1668,18 @@ const styles = StyleSheet.create({
     fontSize: 12,
     marginBottom: 4,
   },
+  slashRow: { gap: 7, paddingRight: 8 },
+  slashChip: {
+    minHeight: 40,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: "#ebe4d6",
+    borderRadius: 10,
+    paddingHorizontal: 10,
+  },
+  slashCommand: { color: "#2f5d3a", fontSize: 12, fontWeight: "800" },
+  slashLabel: { color: "#6f685c", fontSize: 11 },
   attachRow: { maxHeight: 64 },
   attachChip: {
     flexDirection: "row",
@@ -1623,6 +1694,32 @@ const styles = StyleSheet.create({
   },
   thumb: { width: 28, height: 28, borderRadius: 6 },
   attachName: { color: "#1c1915", fontSize: 12, flexShrink: 1 },
+  approvalDock: {
+    minHeight: 52,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    backgroundColor: "#f5e6d2",
+    borderWidth: 1,
+    borderColor: "#e0c9a0",
+    borderRadius: 12,
+    paddingHorizontal: 12,
+  },
+  approvalDockCopy: { flex: 1, paddingVertical: 8 },
+  approvalDockBadge: {
+    color: "#8a5a20",
+    fontSize: 10,
+    fontWeight: "800",
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+  },
+  approvalDockTitle: {
+    color: "#302a23",
+    fontSize: 12,
+    fontWeight: "700",
+    marginTop: 2,
+  },
+  approvalDockAction: { color: "#7d4e18", fontSize: 12, fontWeight: "800" },
   confirmStack: { gap: 8, marginBottom: 8 },
   confirm: {
     backgroundColor: "#f5e6d2",
@@ -1705,6 +1802,12 @@ const styles = StyleSheet.create({
   },
   readonlyTitle: { color: "#5c564c", fontWeight: "700", fontSize: 14 },
   readonlyBody: { color: "#6f685c", fontSize: 13, lineHeight: 18 },
+  readonlyLink: {
+    color: "#2f5d3a",
+    fontSize: 13,
+    fontWeight: "700",
+    paddingVertical: 6,
+  },
   composerReadonlyHint: {
     color: "#7a7368",
     fontSize: 13,

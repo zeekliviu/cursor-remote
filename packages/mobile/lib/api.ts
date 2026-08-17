@@ -11,6 +11,7 @@ import type {
   PairingInfo,
   Project,
 } from "@cursor-remote/shared";
+import { recordHttp } from "./protocol-metrics";
 
 const LEGACY_KEY = "cursor-remote.connection";
 const HOSTS_KEY = "cursor-remote.hosts.v1";
@@ -189,6 +190,7 @@ export class ApiClient {
   }
 
   private async request<T>(path: string, init?: RequestInit): Promise<T> {
+    const requestBody = typeof init?.body === "string" ? init.body : undefined;
     const res = await fetch(`${this.baseUrl()}${path}`, {
       ...init,
       headers: {
@@ -197,7 +199,16 @@ export class ApiClient {
         ...(init?.headers || {}),
       },
     });
-    const body = await res.json().catch(() => ({}));
+    const responseText = await res.text().catch(() => "");
+    recordHttp(requestBody, responseText);
+    let body: unknown = {};
+    if (responseText) {
+      try {
+        body = JSON.parse(responseText);
+      } catch {
+        body = {};
+      }
+    }
     if (!res.ok) {
       throw new Error(
         (body as { error?: string }).error || `HTTP ${res.status}`,
@@ -225,7 +236,9 @@ export class ApiClient {
   }
 
   chat(chatId: string) {
-    return this.request<ChatDetail>(`/chats/${encodeURIComponent(chatId)}`);
+    return this.request<ChatDetail & { revision?: string }>(
+      `/chats/${encodeURIComponent(chatId)}`,
+    );
   }
 
   changedFile(chatId: string, filePath: string) {

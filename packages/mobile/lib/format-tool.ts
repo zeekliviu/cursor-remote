@@ -1,5 +1,35 @@
 import type { ChatMessage } from "@cursor-remote/shared";
 
+export type ToolCategory =
+  | "explore"
+  | "edit"
+  | "terminal"
+  | "web"
+  | "mcp"
+  | "plan"
+  | "subagent"
+  | "other";
+
+export function classifyToolMessage(message: ChatMessage): ToolCategory {
+  const name = (message.tool?.name || "").toLowerCase();
+  if (
+    /read|grep|ripgrep|glob|search_file|list_dir|searchconversation|fetchresource/.test(
+      name,
+    )
+  ) {
+    return "explore";
+  }
+  if (/web|fetch|browser|navigate|screenshot/.test(name)) return "web";
+  if (/edit|write|patch|delete|create_file|strreplace/.test(name)) return "edit";
+  if (/terminal|shell|command|awaitshell/.test(name)) return "terminal";
+  if (/subagent|task|best.of.n|bugbot|security.review/.test(name)) {
+    return "subagent";
+  }
+  if (/todo|plan|mode|question/.test(name)) return "plan";
+  if (/mcp/.test(name)) return "mcp";
+  return "other";
+}
+
 function basename(p: string): string {
   const parts = p.replace(/\\/g, "/").split("/");
   return parts[parts.length - 1] || p;
@@ -63,7 +93,11 @@ export function formatToolMessage(m: ChatMessage): FormattedTool {
   };
 
   switch (name) {
-    case "edit_file_v2": {
+    case "edit_file_v2":
+    case "edit_file":
+    case "StrReplace":
+    case "ApplyPatch":
+    case "Write": {
       const path = str(params?.relativeWorkspacePath || params?.path);
       const plus = m.tool?.additions;
       const minus = m.tool?.deletions;
@@ -80,7 +114,9 @@ export function formatToolMessage(m: ChatMessage): FormattedTool {
         result: stats,
       };
     }
-    case "read_file_v2": {
+    case "read_file_v2":
+    case "read_file":
+    case "ReadFile": {
       const path = str(params?.targetFile || params?.effectiveUri || params?.path);
       const offset = params?.offset;
       const limit = params?.limit;
@@ -99,7 +135,9 @@ export function formatToolMessage(m: ChatMessage): FormattedTool {
         result: total,
       };
     }
-    case "run_terminal_command_v2": {
+    case "run_terminal_command_v2":
+    case "run_terminal_command":
+    case "Shell": {
       const cmd = str(params?.command);
       const desc = str(params?.commandDescription);
       const out = (
@@ -126,7 +164,8 @@ export function formatToolMessage(m: ChatMessage): FormattedTool {
       };
     }
     case "ripgrep_raw_search":
-    case "grep": {
+    case "grep":
+    case "rg": {
       const pattern = str(params?.pattern);
       const path = str(params?.path || params?.glob || ".");
       return {
@@ -135,14 +174,16 @@ export function formatToolMessage(m: ChatMessage): FormattedTool {
         detail: `/${pattern}/ in ${path}`,
       };
     }
-    case "glob_file_search": {
+    case "glob_file_search":
+    case "Glob": {
       return {
         ...base,
         title: "Found files",
         detail: str(params?.globPattern || params?.targetDirectory),
       };
     }
-    case "web_search": {
+    case "web_search":
+    case "WebSearch": {
       return {
         ...base,
         title: "Web search",
@@ -153,29 +194,42 @@ export function formatToolMessage(m: ChatMessage): FormattedTool {
             : undefined,
       };
     }
-    case "web_fetch": {
+    case "web_fetch":
+    case "WebFetch": {
       return {
         ...base,
         title: "Fetched page",
         detail: str(params?.url),
       };
     }
-    case "todo_write": {
+    case "todo_write":
+    case "TodoWrite": {
+      const todos = Array.isArray(params?.todos)
+        ? (params.todos as Array<{ status?: string }>)
+        : [];
+      const done = todos.filter((todo) => todo.status === "completed").length;
+      const active = todos.filter((todo) => todo.status === "in_progress").length;
       return {
         ...base,
         title: "Updated todos",
-        detail: params?.merge ? "merged into existing list" : "replaced list",
-        result: "ok",
+        detail: todos.length
+          ? `${done}/${todos.length} complete${active ? " · active task" : ""}`
+          : params?.merge
+            ? "merged into existing list"
+            : "replaced list",
+        result: todos.length ? undefined : "ok",
       };
     }
-    case "delete_file": {
+    case "delete_file":
+    case "Delete": {
       return {
         ...base,
         title: "Deleted file",
         detail: str(params?.path || params?.relativeWorkspacePath),
       };
     }
-    case "create_plan": {
+    case "create_plan":
+    case "CreatePlan": {
       return {
         ...base,
         title: "Created plan",
@@ -187,6 +241,26 @@ export function formatToolMessage(m: ChatMessage): FormattedTool {
         ...base,
         title: "Switched mode",
         detail: str(params?.target_mode_id || params?.mode),
+      };
+    }
+    case "Subagent": {
+      const description = str(params?.description);
+      return {
+        ...base,
+        title: status === "running" ? "Subagent running" : "Subagent",
+        detail: description || str(params?.prompt).slice(0, 140) || undefined,
+      };
+    }
+    case "AskQuestion": {
+      const questions = Array.isArray(params?.questions)
+        ? (params.questions as unknown[])
+        : [];
+      return {
+        ...base,
+        title: "Asked for input",
+        detail: questions.length
+          ? `${questions.length} ${questions.length === 1 ? "question" : "questions"}`
+          : undefined,
       };
     }
     case "await": {

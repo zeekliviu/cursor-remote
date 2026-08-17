@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  AppState,
   Keyboard,
   KeyboardAvoidingView,
   Platform,
@@ -10,22 +11,41 @@ import {
   View,
   ScrollView,
 } from "react-native";
-import { useLocalSearchParams } from "expo-router";
+import { useFocusEffect, useLocalSearchParams } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useConnection } from "../../lib/connection";
 import { stripAnsi } from "../../lib/strip-ansi";
+import {
+  recordWsClose,
+  recordWsOpen,
+  recordWsReceived,
+  recordWsSent,
+} from "../../lib/protocol-metrics";
+
+const terminalSessionIds = new Map<string, string>();
 
 export default function TerminalScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const { client } = useConnection();
+  const [isFocused, setIsFocused] = useState(false);
   const insets = useSafeAreaInsets();
   const [output, setOutput] = useState("Connecting…\n");
   const [line, setLine] = useState("");
   const [ready, setReady] = useState(false);
   const [cwd, setCwd] = useState<string | null>(null);
   const [kbHeight, setKbHeight] = useState(0);
+  const [appActive, setAppActive] = useState(
+    AppState.currentState === "active",
+  );
   const wsRef = useRef<WebSocket | null>(null);
   const scrollRef = useRef<ScrollView>(null);
+
+  useFocusEffect(
+    useCallback(() => {
+      setIsFocused(true);
+      return () => setIsFocused(false);
+    }, []),
+  );
 
   useEffect(() => {
     const showEvt =
@@ -43,20 +63,35 @@ export default function TerminalScreen() {
   }, []);
 
   useEffect(() => {
-    if (!client || !id) return;
+    const sub = AppState.addEventListener("change", (state) => {
+      setAppActive(state === "active");
+    });
+    return () => sub.remove();
+  }, []);
+
+  useEffect(() => {
+    if (!client || !id || !isFocused || !appActive) return;
     const ws = new WebSocket(client.wsUrl("/terminal"));
     wsRef.current = ws;
     ws.onopen = () => {
-      ws.send(
-        JSON.stringify({
-          type: "attach",
-          projectId: id,
-          cols: 80,
-          rows: 24,
-        }),
-      );
+      if (wsRef.current !== ws) {
+        ws.close();
+        return;
+      }
+      recordWsOpen(false);
+      const raw = JSON.stringify({
+        type: "attach",
+        projectId: id,
+        sessionId: terminalSessionIds.get(id),
+        cols: 80,
+        rows: 24,
+      });
+      ws.send(raw);
+      recordWsSent(raw);
     };
     ws.onmessage = (ev) => {
+      if (wsRef.current !== ws) return;
+      recordWsReceived(String(ev.data));
       try {
         const msg = JSON.parse(String(ev.data)) as {
           type: string;
@@ -64,8 +99,10 @@ export default function TerminalScreen() {
           cwd?: string;
           message?: string;
           code?: number | null;
+          sessionId?: string;
         };
         if (msg.type === "ready") {
+          if (msg.sessionId) terminalSessionIds.set(id, msg.sessionId);
           setReady(true);
           setCwd(msg.cwd || null);
           setOutput((o) => `${o}ready @ ${msg.cwd}\n`);
@@ -75,6 +112,7 @@ export default function TerminalScreen() {
         } else if (msg.type === "error") {
           setOutput((o) => `${o}\nerror: ${msg.message}\n`);
         } else if (msg.type === "exit") {
+          terminalSessionIds.delete(id);
           setReady(false);
           setOutput((o) => `${o}\n[exit ${msg.code}]\n`);
         }
@@ -85,18 +123,29 @@ export default function TerminalScreen() {
         scrollRef.current?.scrollToEnd({ animated: false }),
       );
     };
-    ws.onerror = () => setOutput((o) => `${o}\nwebsocket error\n`);
-    ws.onclose = () => setReady(false);
-    return () => {
-      ws.close();
-      wsRef.current = null;
+    ws.onerror = () => {
+      if (wsRef.current === ws) {
+        setOutput((o) => `${o}\nwebsocket error\n`);
+      }
     };
-  }, [client, id]);
+    ws.onclose = () => {
+      recordWsClose();
+      if (wsRef.current !== ws) return;
+      wsRef.current = null;
+      setReady(false);
+    };
+    return () => {
+      wsRef.current = null;
+      ws.close();
+    };
+  }, [appActive, client, id, isFocused]);
 
   function sendLine() {
     const ws = wsRef.current;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    ws.send(JSON.stringify({ type: "input", data: `${line}\n` }));
+    const raw = JSON.stringify({ type: "input", data: `${line}\n` });
+    ws.send(raw);
+    recordWsSent(raw);
     setLine("");
   }
 

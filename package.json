@@ -16,7 +16,8 @@
     "daemon:start": "node ./scripts/run-daemon.mjs",
     "daemon:dev": "npm run dev -w @cursor-remote/daemon",
     "mobile": "npm run start -w @cursor-remote/mobile -- --clear",
-    "mobile:start": "npm run start -w @cursor-remote/mobile --"
+    "mobile:start": "npm run start -w @cursor-remote/mobile --",
+    "test:ux": "tsx --test packages/mobile/lib/chat-turns.test.ts"
   },
   "engines": {
     "node": ">=20"

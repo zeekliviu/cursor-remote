@@ -18,7 +18,12 @@ import { PulseDot } from "../../lib/pulse-dot";
 export default function ProjectScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
   const { client } = useConnection();
-  const { hostRunning, hostStatus } = useComposerWatch();
+  const {
+    hostRunning,
+    hostStatus,
+    pendingApprovals,
+    lastCompletedAt,
+  } = useComposerWatch();
   const navigation = useNavigation();
   const [project, setProject] = useState<Project | null>(null);
   const [chats, setChats] = useState<ChatSummary[]>([]);
@@ -26,6 +31,22 @@ export default function ProjectScreen() {
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
   const [opening, setOpening] = useState(false);
+  const [completionClock, setCompletionClock] = useState(Date.now());
+
+  useEffect(() => {
+    if (!lastCompletedAt) return;
+    const remaining = 15 * 60 * 1000 - (Date.now() - lastCompletedAt);
+    if (remaining <= 0) {
+      setCompletionClock(Date.now());
+      return;
+    }
+    const timer = setTimeout(() => setCompletionClock(Date.now()), remaining + 50);
+    return () => clearTimeout(timer);
+  }, [lastCompletedAt]);
+  const readyForReview = Boolean(
+    lastCompletedAt &&
+      completionClock - lastCompletedAt < 15 * 60 * 1000,
+  );
 
   const refresh = useCallback(async () => {
     if (!client || !id) return;
@@ -187,13 +208,20 @@ export default function ProjectScreen() {
                   canMessage ? styles.badgeTextLive : styles.badgeTextReadonly,
                 ]}
               >
-                {canMessage ? "Can message" : "View only"}
+                {c.isSubagent
+                  ? "Subagent"
+                  : canMessage
+                    ? "Can message"
+                    : "View only"}
               </Text>
             </View>
           </View>
           <Text style={styles.cardMeta}>
             {c.mode || "agent"}
-            {!canMessage ? " · subagent / explore" : ""}
+            {c.subagentIds?.length
+              ? ` · ${c.subagentIds.length} ${c.subagentIds.length === 1 ? "subagent" : "subagents"}`
+              : ""}
+            {!canMessage ? " · explore transcript" : ""}
             {c.lastUpdatedAt
               ? ` · ${new Date(c.lastUpdatedAt).toLocaleString()}`
               : ""}
@@ -224,11 +252,17 @@ export default function ProjectScreen() {
         are view-only (no Composer input in Cursor).
       </Text>
 
-      {hostRunning ? (
+      {hostRunning ||
+      pendingApprovals > 0 ||
+      readyForReview ? (
         <View style={styles.runningRow}>
-          <PulseDot />
+          {hostRunning || pendingApprovals > 0 ? <PulseDot /> : null}
           <Text style={styles.runningText} numberOfLines={1}>
-            Agent running on host{hostStatus ? ` · ${hostStatus}` : ""}
+            {pendingApprovals > 0
+              ? `Needs approval · ${pendingApprovals} pending`
+              : hostRunning
+                ? `Working${hostStatus ? ` · ${hostStatus}` : ""}`
+                : "Ready for review"}
           </Text>
         </View>
       ) : null}
@@ -256,7 +290,7 @@ export default function ProjectScreen() {
             <Text style={[styles.section, styles.sectionInRow]}>
               Can message
             </Text>
-            {hostRunning ? <PulseDot /> : null}
+            {hostRunning || pendingApprovals > 0 ? <PulseDot /> : null}
           </View>
           {messageable.map(renderChat)}
         </>

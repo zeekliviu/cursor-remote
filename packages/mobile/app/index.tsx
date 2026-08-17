@@ -16,6 +16,7 @@ import { useConnection } from "../lib/connection";
 import { useComposerWatch } from "../lib/composer-watch";
 import { PulseDot } from "../lib/pulse-dot";
 import type { HostProfile } from "../lib/api";
+import { formatDuration } from "../lib/chat-turns";
 
 export default function HomeScreen() {
   const {
@@ -28,13 +29,35 @@ export default function HomeScreen() {
     removeHost,
     disconnect,
   } = useConnection();
-  const { hostRunning, hostStatus, pendingApprovals } = useComposerWatch();
+  const {
+    hostRunning,
+    hostStatus,
+    pendingApprovals,
+    lastCompletedAt,
+    lastCompletedDurationMs,
+  } = useComposerWatch();
   const [projects, setProjects] = useState<Project[]>([]);
   const [health, setHealth] = useState<ComposerHealth | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [renameDraft, setRenameDraft] = useState("");
+  const [completionClock, setCompletionClock] = useState(Date.now());
+
+  useEffect(() => {
+    if (!lastCompletedAt) return;
+    const remaining = 15 * 60 * 1000 - (Date.now() - lastCompletedAt);
+    if (remaining <= 0) {
+      setCompletionClock(Date.now());
+      return;
+    }
+    const timer = setTimeout(() => setCompletionClock(Date.now()), remaining + 50);
+    return () => clearTimeout(timer);
+  }, [lastCompletedAt]);
+  const readyForReview = Boolean(
+    lastCompletedAt &&
+      completionClock - lastCompletedAt < 15 * 60 * 1000,
+  );
 
   const refresh = useCallback(async () => {
     if (!client) return;
@@ -221,13 +244,21 @@ export default function HomeScreen() {
           ) : null}
         </View>
       ) : null}
-      {hostRunning || pendingApprovals > 0 ? (
+      {hostRunning ||
+      pendingApprovals > 0 ||
+      readyForReview ? (
         <View style={styles.hostBusy}>
-          <PulseDot />
+          {hostRunning || pendingApprovals > 0 ? <PulseDot /> : null}
           <Text style={styles.hostBusyText} numberOfLines={1}>
             {pendingApprovals > 0
-              ? `${pendingApprovals} waiting for approval`
-              : `Agent running${hostStatus ? ` · ${hostStatus}` : ""}`}
+              ? `Needs approval · ${pendingApprovals} ${pendingApprovals === 1 ? "request" : "requests"}`
+              : hostRunning
+                ? `Working${hostStatus ? ` · ${hostStatus}` : ""}`
+                : `Ready for review${
+                    lastCompletedDurationMs
+                      ? ` · ${formatDuration(lastCompletedDurationMs)}`
+                      : ""
+                  }`}
           </Text>
         </View>
       ) : null}
