@@ -31,8 +31,8 @@ Cursor’s agent loop is powerful on a big screen — and awkward when you step 
 |------------|----------------|
 | **Agents-panel switch** | Focuses the matching repo + chat in Cursor’s Agents → Repositories sidebar (React fiber `onSelectAgent`). Does **not** spawn windows or type into Open Recent. |
 | **Messageable vs view-only** | Parent agent chats accept input; explore / subagent transcripts stay read-only on the phone. |
-| **Approvals** | Scrapes Run / Skip–style confirmations (deduped, no button-row ghosts) and acts on them from the phone. |
-| **Live agent activity** | Stop-button–aware status scrape; Composer WebSocket pushes `{ type: "activity" }` when it changes. Full status strings stay intact for the phone header. |
+| **Typed approvals** | Classifies shell, network, deletion, external-file, MCP, and browser requests; preserves Skip / Run / Always Run and scopes actions to the exact dialog. |
+| **Live agent activity** | One shared, event-driven CDP monitor pushes changed-only activity, approvals, and revisioned chat deltas. Full status strings stay intact for the phone header. |
 | **Chat images** | Surfaces Composer attachments and screenshot assets; `GET /media` serves them with token auth. |
 | **Latest-turn Files Changed** | Matches Cursor’s per-turn card — not the whole-chat edit history. |
 | **Foreground Cursor** | Activates the existing Cursor app before CDP clicks (no new instances). |
@@ -41,16 +41,27 @@ Cursor’s agent loop is powerful on a big screen — and awkward when you step 
 
 | Capability | What it means |
 |------------|----------------|
-| **Compact composer** | Attach · model chip · message · send/stop on one row. |
+| **Compact composer** | Attach · model chip · message · queue/send + separate stop on one row; long-press supports Interrupt & send. |
 | **Cached model picker** | Opens instantly from a per-host cache; selection is local until you apply. Grouped by vendor (Anthropic, OpenAI, Google, Cursor, …). |
-| **Approvals UI** | Soft-enter cards above the composer with Run / Skip (and friends). |
-| **Local notifications** | Agent finished + needs approval (Expo Go–safe; no remote push). Deep-link back into the chat. |
+| **Conversation density** | Per-host Compact / Balanced / Detailed transcript modes with persisted expansion state. |
+| **Turn summaries** | Cursor-style `Worked for …` rows, semantic tool clusters, visible failures, and the latest three turns kept easy to inspect. |
+| **Approvals UI** | Compact approval dock opens a queue-aware sheet with risk/resource context and guarded persistent permissions. |
+| **Artifact review** | Full-screen latest-turn file diffs, image gallery, terminal deep links, plan/todo/subagent rows. |
+| **Foreground notifications** | Agent finished + needs approval while the app is active. The socket closes in background to save battery and performs a full sync on resume. |
 | **Live status pulse** | Full activity label under the chat title (wraps; not truncated). |
 | **Scroll-to-latest pill** | When you scroll up mid-run. |
 | **Long-press copy / quote** | On message bubbles. |
 | **Open in Cursor** | Project screen focuses that repo on the host. |
 | **Host running strip** | Home / project when the agent is busy. |
 | **Inline chat images** | Rendered under bubbles when the host has the files. |
+
+### Efficient foreground sync
+
+- One foreground WebSocket replaces overlapping activity, approval, health, and full-chat polling.
+- Chat subscriptions send an initial snapshot followed by revisioned tail deltas; unchanged state emits no phone traffic.
+- The daemon shares one debounced CDP observer across clients and watches Cursor’s SQLite/WAL files only for subscribed chats.
+- Composer and terminal sockets close when the app backgrounds; terminal PTYs remain reattachable for up to one hour.
+- A capability handshake enables the new protocol immediately while retaining a foreground-only fallback during rolling upgrades.
 
 ---
 
@@ -105,7 +116,7 @@ npm run mobile
 
 Scan the QR from Expo, then in the app: **Add host** → scan the daemon pairing QR (or enter host / port `7843` / token). You can save several hosts (Mac + Windows) and switch between them on the home screen.
 
-> Local notifications, clipboard, and haptics work in Expo Go. A custom dev client is only needed if you want remote push later (this app does not use remote push).
+> Foreground notifications, clipboard, and haptics work in Expo Go. The app intentionally does not keep a background socket or use remote push.
 
 ### 4 — Sanity check
 
@@ -194,7 +205,7 @@ Keep CDP off the LAN; bind the daemon on Tailscale / LAN with token auth only.
 | POST | `/composer/model` | Pick model / params |
 | POST | `/composer/upload` | Base64 attachment → `~/.cursor-remote/uploads` |
 | WS | `/terminal?token=` | PTY in project root |
-| WS | `/composer?token=` | Live status, confirmations, DOM events |
+| WS | `/composer?token=` | Initial state + changed-only activity, confirmations, and revisioned chat deltas |
 
 ---
 
