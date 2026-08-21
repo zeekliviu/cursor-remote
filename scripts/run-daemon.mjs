@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Cross-platform daemon start (build if needed).
+ * Cross-platform daemon start (build if needed, ensure Cursor CDP).
  *   npm run daemon:start
  */
 import { spawn, spawnSync } from "node:child_process";
@@ -8,6 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { ensureCursorCdp } from "./ensure-cursor-cdp.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
@@ -32,6 +33,14 @@ if (!fs.existsSync(dist)) {
 const fixPty = path.join(root, "packages", "daemon", "scripts", "fix-pty-perms.mjs");
 if (fs.existsSync(fixPty)) {
   spawnSync(process.execPath, [fixPty], { cwd: root, stdio: "ignore" });
+}
+
+const cdp = await ensureCursorCdp();
+console.log(`[cursor-remote] ${cdp.message}`);
+if (!cdp.ok) {
+  console.error(
+    "[cursor-remote] Continuing without CDP — Composer actions will fail until Cursor is launched with remote debugging.",
+  );
 }
 
 console.log(

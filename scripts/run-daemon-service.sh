@@ -12,4 +12,6 @@ export CDP_URL="${CDP_URL:-http://127.0.0.1:9222}"
 export DATA_DIR="${DATA_DIR:-$HOME/.cursor-remote}"
 
 cd "$ROOT"
+# Best-effort: start Cursor with CDP if missing (does not block forever).
+node "$ROOT/scripts/ensure-cursor-cdp.mjs" || true
 exec node "$ROOT/packages/daemon/dist/index.js"

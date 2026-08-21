@@ -1,41 +1,112 @@
 import { spawn } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * Best-effort: un-minimize / foreground the Cursor app so CDP clicks land.
- * Project/chat switching is done by clicking Agents → Repositories in the
- * existing window (see CdpDriver.selectInAgentsPanel).
+ *
+ * Important (Windows): Cursor's CDP build does NOT expose
+ * Browser.getWindowForTarget, so OS-level restore is the only path.
+ * The activator PowerShell must compile (Add-Type) and actually run —
+ * prior versions failed silently due to unsupported C# syntax.
  */
 export async function activateCursorApp(): Promise<void> {
   try {
     if (process.platform === "darwin") {
-      await runDetached("osascript", [
-        "-e",
-        'tell application "Cursor" to activate',
-      ]);
+      await runAndWait(
+        "osascript",
+        [
+          "-e",
+          'tell application "Cursor" to reopen',
+          "-e",
+          'tell application "Cursor" to activate',
+          "-e",
+          'tell application "System Events" to tell process "Cursor" to set frontmost to true',
+        ],
+        2500,
+      );
       return;
     }
     if (process.platform === "win32") {
-      await runDetached("powershell.exe", [
-        "-NoProfile",
-        "-Command",
-        `(New-Object -ComObject WScript.Shell).AppActivate('Cursor'); Start-Sleep -Milliseconds 200`,
-      ]);
+      const script = windowsActivateScriptPath();
+      if (!script) {
+        console.warn("[cursor-remote] activate-cursor.ps1 missing");
+        return;
+      }
+      const result = await runAndWait(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-STA",
+          "-ExecutionPolicy",
+          "Bypass",
+          "-File",
+          script,
+        ],
+        12_000,
+        { windowsHide: true, capture: true },
+      );
+      if (result.stderr && /error|fail|exception/i.test(result.stderr)) {
+        console.warn(
+          "[cursor-remote] activate-cursor.ps1:",
+          result.stderr.slice(0, 500),
+        );
+      }
     }
-  } catch {
-    // ignore — CDP may still work if the window is already focused
+  } catch (err) {
+    console.warn(
+      "[cursor-remote] activateCursorApp failed:",
+      (err as Error).message,
+    );
   }
 }
 
-function runDetached(cmd: string, args: string[]): Promise<void> {
+function windowsActivateScriptPath(): string | null {
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    path.join(here, "activate-cursor.ps1"),
+    path.join(here, "..", "src", "activate-cursor.ps1"),
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
+function runAndWait(
+  cmd: string,
+  args: string[],
+  timeoutMs: number,
+  opts: { windowsHide?: boolean; capture?: boolean } = {},
+): Promise<{ code: number | null; stderr: string }> {
   return new Promise((resolve) => {
+    let settled = false;
+    let stderr = "";
+    const done = (code: number | null = null) => {
+      if (settled) return;
+      settled = true;
+      resolve({ code, stderr });
+    };
     const child = spawn(cmd, args, {
-      detached: true,
-      stdio: "ignore",
+      stdio: opts.capture ? ["ignore", "ignore", "pipe"] : "ignore",
       shell: false,
-      windowsHide: true,
+      windowsHide: opts.windowsHide ?? true,
     });
-    child.on("error", () => resolve());
-    child.unref();
-    setTimeout(resolve, 80);
+    if (opts.capture && child.stderr) {
+      child.stderr.on("data", (d) => {
+        stderr += d.toString();
+      });
+    }
+    child.on("error", () => done(1));
+    child.on("exit", (code) => done(code));
+    setTimeout(() => {
+      try {
+        child.kill();
+      } catch {
+        // ignore
+      }
+      done(-1);
+    }, timeoutMs);
   });
 }

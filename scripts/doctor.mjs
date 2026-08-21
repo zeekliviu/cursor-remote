@@ -54,7 +54,7 @@ async function probe(url) {
 
 const cdpUp = await probe(`http://127.0.0.1:${cdpPort}/json/version`);
 if (cdpUp) ok.push(`CDP up on :${cdpPort}`);
-else issues.push(`CDP not reachable on :${cdpPort} — run: npm run cursor`);
+else issues.push(`CDP not reachable on :${cdpPort} — run: npm run daemon:start (auto-launches Cursor) or npm run cursor`);
 
 const daemonUp = await probe(`http://127.0.0.1:${port}/healthz`);
 if (daemonUp) ok.push(`daemon up on :${port}`);
