@@ -35,7 +35,7 @@ Cursor’s agent loop is powerful on a big screen — and awkward when you step 
 | **Live agent activity** | One shared, event-driven CDP monitor pushes changed-only activity, approvals, and revisioned chat deltas. Full status strings stay intact for the phone header. |
 | **Chat images** | Surfaces Composer attachments and screenshot assets; `GET /media` serves them with token auth. |
 | **Latest-turn Files Changed** | Matches Cursor’s per-turn card — not the whole-chat edit history. |
-| **Foreground Cursor** | Activates the existing Cursor app before CDP clicks (no new instances). |
+| **Foreground Cursor** | Activates and un-minimizes the existing Cursor app before CDP clicks and when a project is selected (no new instances). |
 
 ### On the phone (Expo)
 
@@ -85,21 +85,15 @@ npm run setup
 
 `setup` installs deps, builds the daemon, and fixes macOS `node-pty` permissions.
 
-### 1 — Start Cursor with CDP
-
-Quit Cursor completely first, then:
-
-```bash
-npm run cursor
-```
-
-(macOS/Windows wrapper. Or: `./scripts/launch-cursor-debug.sh` / `.\scripts\launch-cursor-debug.ps1`)
-
-### 2 — Start the daemon
+### 1 — Start the daemon
 
 ```bash
 npm run daemon:start
 ```
+
+This builds if needed, checks CDP on `:9222`, and **starts Cursor with `--remote-debugging-port` if CDP is down**. If Cursor is already open *without* debugging, it quits and relaunches with CDP (set `CURSOR_REMOTE_NO_RESTART=1` to refuse that, or `CURSOR_REMOTE_SKIP_CDP_ENSURE=1` to skip entirely).
+
+You can still launch CDP yourself first with `npm run cursor`.
 
 You should see `listening on http://0.0.0.0:7843`. Open that URL in a browser on the host to see the pairing QR.
 
@@ -108,7 +102,7 @@ Token file (auto-created):
 - macOS/Linux: `~/.cursor-remote/auth.json`
 - Windows: `%USERPROFILE%\.cursor-remote\auth.json`
 
-### 3 — Phone (Expo Go)
+### 2 — Phone (Expo Go)
 
 ```bash
 npm run mobile
@@ -118,7 +112,7 @@ Scan the QR from Expo, then in the app: **Add host** → scan the daemon pairing
 
 > Foreground notifications, clipboard, and haptics work in Expo Go. The app intentionally does not keep a background socket or use remote push.
 
-### 4 — Sanity check
+### 3 — Sanity check
 
 ```bash
 npm run doctor
@@ -131,8 +125,8 @@ npm run doctor
 | Step | Action | Expect |
 |------|--------|--------|
 | Setup | `npm run setup` | Build OK |
-| CDP | `npm run cursor` | `http://127.0.0.1:9222/json/version` works in browser |
-| Daemon | `npm run daemon:start` | `/healthz` → `{ ok: true }` |
+| Daemon | `npm run daemon:start` | Cursor+CDP up; `/healthz` → `{ ok: true }` |
+| CDP | open `http://127.0.0.1:9222/json/version` | Browser shows Chrome version JSON |
 | Pair | Phone → Add host → scan `:7843` QR | Projects list loads |
 | Chat | Open a **messageable** project chat | Messages stream; Send works when CDP is up |
 | Switch | Open another chat / project | Same Cursor window; Agents panel selects repo + chat |
@@ -154,7 +148,7 @@ npm run doctor
 | `npm run setup` | Fresh clone: install + build |
 | `npm run doctor` | Check Node / build / CDP / daemon |
 | `npm run cursor` | Launch Cursor with `--remote-debugging-port=9222` |
-| `npm run daemon:start` | Run daemon (builds if `dist` missing) |
+| `npm run daemon:start` | Run daemon (builds if needed; ensures Cursor CDP) |
 | `npm run daemon:dev` | Daemon with `tsx watch` |
 | `npm run mobile` | Expo with `--clear` |
 | `npm run build` | Rebuild shared + daemon only |
@@ -168,6 +162,8 @@ CDP_URL=http://127.0.0.1:9222
 CDP_PORT=9222
 DATA_DIR=~/.cursor-remote   # Windows: %USERPROFILE%\.cursor-remote
 CURSOR_BIN=/path/to/Cursor  # if not in the default install location
+CURSOR_REMOTE_SKIP_CDP_ENSURE=1  # daemon:start does not launch/relaunch Cursor
+CURSOR_REMOTE_NO_RESTART=1       # do not quit a non-CDP Cursor to relaunch
 ```
 
 ---
@@ -175,8 +171,7 @@ CURSOR_BIN=/path/to/Cursor  # if not in the default install location
 ## Always-on (optional)
 
 1. Install [Tailscale](https://tailscale.com) (or your VPN) on host + phone.
-2. Start Cursor with CDP at login (`npm run cursor` / scheduled task).
-3. Run the daemon at login:
+2. Run the daemon at login (`daemon:start` will bring up Cursor+CDP if needed):
    - **macOS:** edit paths in `scripts/com.cursorremote.daemon.plist` → copy to `~/Library/LaunchAgents/` → `launchctl load …` (helper: `scripts/run-daemon-service.sh`)
    - **Windows:** see [docs/windows.md](docs/windows.md) (Task Scheduler)
 

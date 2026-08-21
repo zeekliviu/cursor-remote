@@ -15,15 +15,14 @@ npm run setup
 ## Local test (each session)
 
 ```powershell
-# Terminal / window A — Cursor with CDP (quit Cursor first)
-npm run cursor
-
-# Terminal B — daemon
+# Terminal A — daemon (auto-starts Cursor with CDP if needed)
 npm run daemon:start
 
-# Terminal C — Expo (from your Mac is fine too; phone only needs the Windows host reachable)
+# Terminal B — Expo (from your Mac is fine too; phone only needs the Windows host reachable)
 npm run mobile
 ```
+
+If Cursor was already open without debugging, `daemon:start` quits and relaunches it with `--remote-debugging-port=9222`. To skip that: `$env:CURSOR_REMOTE_NO_RESTART=1`.
 
 Open `http://127.0.0.1:7843` on the PC, scan the QR in the phone app (**Add host**, label e.g. `PC birou`).
 
@@ -46,12 +45,11 @@ Token / uploads: `%USERPROFILE%\.cursor-remote\` (not in the git repo).
 
 ## Always-on (Task Scheduler)
 
-1. At logon, start Cursor with CDP:  
-   `powershell -File C:\path\to\cursor-remote\scripts\launch-cursor-debug.ps1`
-2. At logon, start the daemon:
-   - Program: `node`
-   - Arguments: `C:\path\to\cursor-remote\packages\daemon\dist\index.js`
-   - Start in: `C:\path\to\cursor-remote`
-   - Env (optional): `PORT=7843`, `BIND_HOST=0.0.0.0`, `CDP_URL=http://127.0.0.1:9222`, `DATA_DIR=%USERPROFILE%\.cursor-remote`
+At logon, call `npm run daemon:start` (or `node scripts\run-daemon.mjs`) after `npm run setup` once. That entry point ensures Cursor is running with CDP, then starts the daemon.
 
-Or call `npm run daemon:start` from a logon script after `npm run setup` once.
+Alternatively, point Task Scheduler at:
+
+- Program: `node`
+- Arguments: `C:\path\to\cursor-remote\scripts\run-daemon.mjs`
+- Start in: `C:\path\to\cursor-remote`
+- Env (optional): `PORT=7843`, `BIND_HOST=0.0.0.0`, `CDP_URL=http://127.0.0.1:9222`, `DATA_DIR=%USERPROFILE%\.cursor-remote`
