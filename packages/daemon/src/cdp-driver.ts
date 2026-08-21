@@ -501,6 +501,12 @@ export class CdpDriver {
     }
 
     await this.ensurePage(chosen.targetId);
+    // CDP restore first (works even when OS focus steal is blocked), then OS
+    // taskbar-style activate so input/model popovers actually receive events.
+    await this.activateCurrentPage();
+    if (opts.skipActivate) {
+      await activateCursorApp();
+    }
     await this.activateCurrentPage();
 
     let chatSelected = false;
@@ -1054,9 +1060,48 @@ export class CdpDriver {
     return bestScore > 0 ? best : undefined;
   }
 
+  /**
+   * Un-minimize + focus the current CDP target. OS-level activation can still
+   * fail under Windows foreground-lock rules, so we always ask Electron to
+   * restore via Browser.setWindowBounds (immune to those rules) before
+   * Target.activateTarget / window.focus.
+   */
   private async activateCurrentPage(): Promise<void> {
     const page = this.page;
+    const browser = this.browser;
     if (!page) return;
+
+    if (browser) {
+      try {
+        const windowId = await page.windowId().catch(() => null);
+        if (windowId) {
+          // Always force normal — some Electron builds report "normal" while
+          // the OS window is still minimized/cloaked, so a conditional check
+          // would skip the restore that CDP needs for input/model UI.
+          await browser
+            .setWindowBounds(windowId, { windowState: "normal" })
+            .catch(() => undefined);
+          const bounds = await browser
+            .getWindowBounds(windowId)
+            .catch(() => null);
+          if (bounds?.windowState === "minimized") {
+            // Explicit size nudge forces a real restore on stubborn builds.
+            await browser
+              .setWindowBounds(windowId, {
+                windowState: "normal",
+                left: typeof bounds.left === "number" ? bounds.left : 80,
+                top: typeof bounds.top === "number" ? bounds.top : 80,
+                width: Math.max(bounds.width || 0, 1100),
+                height: Math.max(bounds.height || 0, 700),
+              })
+              .catch(() => undefined);
+          }
+        }
+      } catch {
+        // ignore — fall through to Target.activateTarget
+      }
+    }
+
     try {
       await page.bringToFront();
     } catch {
@@ -1075,9 +1120,23 @@ export class CdpDriver {
     }
   }
 
-  async sendMessage(text: string, submit = true): Promise<void> {
+  /**
+   * Paste into Composer and optionally submit.
+   * Cursor shortcuts while Agent is working:
+   *   Enter           → queue (wait for current turn)
+   *   Ctrl/Cmd+Enter  → send immediately (bypass queue)
+   * Never click the Send button for submit — while the agent runs it often
+   * means "Send now", which interrupts instead of queueing.
+   */
+  async sendMessage(
+    text: string,
+    submit = true,
+    opts?: { force?: boolean },
+  ): Promise<void> {
     await activateCursorApp();
     const page = await this.ensurePage();
+    await this.activateCurrentPage();
+    await activateCursorApp();
     await this.activateCurrentPage();
     await this.withLock(this.targetId || "default", async () => {
       const inputSel = await this.firstMatching(page, this.selectors.chatInput);
@@ -1132,14 +1191,16 @@ export class CdpDriver {
       }
 
       if (submit) {
-        const btn = await this.firstMatching(page, this.selectors.sendButton);
-        if (btn) {
-          await page.click(btn);
-        } else {
-          // Prefer chord that won't ambiguous-queue on some builds
-          await page.keyboard.down(process.platform === "darwin" ? "Meta" : "Control");
+        if (opts?.force) {
+          await page.keyboard.down(
+            process.platform === "darwin" ? "Meta" : "Control",
+          );
           await page.keyboard.press("Enter");
-          await page.keyboard.up(process.platform === "darwin" ? "Meta" : "Control");
+          await page.keyboard.up(
+            process.platform === "darwin" ? "Meta" : "Control",
+          );
+        } else {
+          await page.keyboard.press("Enter");
         }
       }
     });
@@ -1325,31 +1386,56 @@ export class CdpDriver {
     return picker;
   }
 
-  /** Nested Model/Auto submenu — needs a real hover. */
+  /** Nested Model submenu — Cursor puts Effort/Context triggers BEFORE Model. */
   private async expandModelSubmenu(page: Page): Promise<void> {
-    const submenuSels = [
-      '[data-component="menu-submenu-trigger"]',
-      ".ui-menu__submenu-trigger",
-      '[role="menuitem"][aria-haspopup="menu"]',
-    ];
-    for (const sel of submenuSels) {
-      const handle = await page.$(sel);
-      if (!handle) continue;
-      try {
-        await handle.hover();
-        await new Promise((r) => setTimeout(r, 200));
-        await handle.click({ delay: 20 }).catch(() => undefined);
-      } finally {
-        await handle.dispose();
-      }
-      break;
-    }
-    const deadline = Date.now() + 2000;
+    const opened = await page.evaluate(() => {
+      const normalize = (s: string) =>
+        s
+          .replace(/[\u200b-\u200d\ufeff]/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+
+      const triggers = Array.from(
+        document.querySelectorAll(
+          '[data-component="menu-submenu-trigger"], .ui-menu__submenu-trigger',
+        ),
+      ) as HTMLElement[];
+
+      // Left label in item-content is "Model"; right side holds the name.
+      const modelTrigger =
+        triggers.find((el) => {
+          const content = el.querySelector(
+            '[data-component="menu-item-content"], .ui-menu__item-content',
+          ) as HTMLElement | null;
+          const left = normalize(content?.innerText || "")
+            .split("\n")[0]
+            .trim();
+          return /^model$/i.test(left);
+        }) ||
+        triggers.find((el) => {
+          const full = normalize(el.innerText || "").split("\n")[0] || "";
+          return /^model\b/i.test(full);
+        });
+
+      if (!modelTrigger) return false;
+      modelTrigger.dispatchEvent(
+        new MouseEvent("mouseover", { bubbles: true, cancelable: true }),
+      );
+      modelTrigger.click();
+      return true;
+    });
+
+    if (!opened) return;
+
+    const deadline = Date.now() + 2500;
     while (Date.now() < deadline) {
       const ready = await page.evaluate(() => {
         const names = document.querySelectorAll(
           ".ui-model-picker__item-content-name, [class*='model-picker__item-content-name']",
         ).length;
+        const list = document.querySelector(
+          '[data-testid="selected-model-list-submenu"]',
+        );
         const auto = Array.from(
           document.querySelectorAll('[role="menuitem"]'),
         ).some((n) =>
@@ -1357,20 +1443,62 @@ export class CdpDriver {
             ((n as HTMLElement).innerText || "").trim().split("\n")[0] || "",
           ),
         );
-        return names > 0 || auto;
+        return names > 0 || Boolean(list) || auto;
       });
       if (ready) break;
       await new Promise((r) => setTimeout(r, 100));
     }
   }
 
+  private async openParamSubmenu(
+    page: Page,
+    sectionTitle: string,
+  ): Promise<boolean> {
+    return page.evaluate((wantTitle) => {
+      const normalize = (s: string) =>
+        s
+          .replace(/[\u200b-\u200d\ufeff]/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
+      const want = normalize(wantTitle).toLowerCase();
+      const triggers = Array.from(
+        document.querySelectorAll(
+          '[data-component="menu-submenu-trigger"], .ui-menu__submenu-trigger',
+        ),
+      ) as HTMLElement[];
+      for (const el of triggers) {
+        const content = el.querySelector(
+          '[data-component="menu-item-content"], .ui-menu__item-content',
+        );
+        const left = normalize(
+          (content as HTMLElement | null)?.innerText || "",
+        )
+          .split("\n")[0]
+          .split(/\s+/)[0];
+        const full = normalize(el.innerText || "").split("\n")[0] || "";
+        if (
+          left.toLowerCase() === want ||
+          full.toLowerCase().startsWith(want + " ") ||
+          full.toLowerCase() === want
+        ) {
+          el.dispatchEvent(
+            new MouseEvent("mouseover", { bubbles: true, cancelable: true }),
+          );
+          el.click();
+          return true;
+        }
+      }
+      return false;
+    }, sectionTitle);
+  }
+
   private async clickMenuItemByLabel(
     page: Page,
     label: string,
-    opts?: { checkbox?: boolean; role?: string },
+    opts?: { checkbox?: boolean; role?: string; scope?: "params" | "any" },
   ): Promise<boolean> {
     return page.evaluate(
-      (wantRaw, checkbox, role) => {
+      (wantRaw, checkbox, role, scope) => {
         const normalize = (s: string) =>
           s
             .replace(/[\u200b-\u200d\ufeff]/g, "")
@@ -1382,12 +1510,46 @@ export class CdpDriver {
           : checkbox
             ? '[role="menuitemcheckbox"]'
             : '[role="menuitem"],[role="menuitemradio"],[role="option"]';
-        for (const node of Array.from(document.querySelectorAll(sel))) {
-          const el = node as HTMLElement;
-          const t = normalize(el.innerText || "").split("\n")[0] || "";
-          if (t.toLowerCase() === want) {
-            el.click();
-            return true;
+        const menus = Array.from(document.querySelectorAll('[role="menu"]'));
+        let roots: ParentNode[] = [document];
+        if (scope === "params") {
+          const param =
+            menus.find((m) =>
+              /parameters/i.test(m.getAttribute("aria-label") || ""),
+            ) ||
+            menus.find((m) =>
+              m.getAttribute("data-testid") ===
+              "selected-model-parameters-submenu-menu",
+            ) ||
+            menus.find((m) =>
+              /Effort|Context|Thinking|Fast/i.test(
+                (m as HTMLElement).innerText || "",
+              ),
+            );
+          // Prefer the deepest open submenu (Effort options, etc.).
+          const sub =
+            menus.find((m) =>
+              /^parameter-submenu-/i.test(m.getAttribute("data-testid") || ""),
+            ) ||
+            menus.find((m) => m.hasAttribute("data-submenu")) ||
+            menus.find((m) =>
+              /options$/i.test(m.getAttribute("aria-label") || ""),
+            );
+          roots = [sub, param].filter(Boolean) as ParentNode[];
+          if (!roots.length) roots = [document];
+        }
+        for (const root of roots) {
+          for (const node of Array.from(root.querySelectorAll(sel))) {
+            const el = node as HTMLElement;
+            if (el.getAttribute("aria-haspopup") === "menu") continue;
+            if (el.getAttribute("data-component") === "menu-submenu-trigger") {
+              continue;
+            }
+            const t = normalize(el.innerText || "").split("\n")[0] || "";
+            if (t.toLowerCase() === want) {
+              el.click();
+              return true;
+            }
           }
         }
         return false;
@@ -1395,6 +1557,7 @@ export class CdpDriver {
       label,
       Boolean(opts?.checkbox),
       opts?.role || "",
+      opts?.scope || "any",
     );
   }
 
@@ -1403,7 +1566,26 @@ export class CdpDriver {
     modelLabel: string,
   ): Promise<boolean> {
     if (/^auto$/i.test(modelLabel.trim())) {
-      return this.clickMenuItemByLabel(page, "Auto");
+      return page.evaluate(() => {
+        const normalize = (s: string) =>
+          s.replace(/[\u200b-\u200d\ufeff]/g, "").replace(/\s+/g, " ").trim();
+        const list =
+          document.querySelector(
+            '[data-testid="selected-model-list-submenu"]',
+          ) || document;
+        for (const node of Array.from(
+          list.querySelectorAll('[role="menuitem"],[role="menuitemradio"]'),
+        )) {
+          const el = node as HTMLElement;
+          if (el.getAttribute("aria-haspopup") === "menu") continue;
+          const t = normalize(el.innerText || "").split("\n")[0] || "";
+          if (/^auto$/i.test(t)) {
+            el.click();
+            return true;
+          }
+        }
+        return false;
+      });
     }
     return page.evaluate((label) => {
       const normalize = (s: string) =>
@@ -1411,22 +1593,13 @@ export class CdpDriver {
           .replace(/[\u200b-\u200d\ufeff]/g, "")
           .replace(/\s+/g, " ")
           .trim();
-      const key = (s: string) =>
-        normalize(s)
-          .replace(
-            /\b(extra\s*high|xhigh|high|medium|low|fast|max|no thinking)\b/gi,
-            "",
-          )
-          .replace(/\s+/g, " ")
-          .trim()
-          .toLowerCase();
+      // Keep effort/speed tokens in the match key — Cursor bakes them into
+      // row labels ("Claude Opus 5 High", "Composer 2.5 Fast").
+      const key = (s: string) => normalize(s).toLowerCase();
       const want = key(label);
-      const wantFull = normalize(label).toLowerCase();
-      const items = Array.from(
-        document.querySelectorAll(
-          '[role="menuitem"],[role="menuitemradio"],.ui-model-picker__item-content-name',
-        ),
-      ) as HTMLElement[];
+      const paramNoise =
+        /^(effort|context|thinking|options|max mode|model|low|medium|high|extra high|xhigh|fast)$/i;
+
       const tryClick = (el: HTMLElement) => {
         const row =
           (el.closest(
@@ -1435,16 +1608,53 @@ export class CdpDriver {
         row.click();
         return true;
       };
+
+      const list =
+        document.querySelector(
+          '[data-testid="selected-model-list-submenu"]',
+        ) || document;
+
+      const nameNodes = Array.from(
+        list.querySelectorAll(
+          ".ui-model-picker__item-content-name, [class*='model-picker__item-content-name']",
+        ),
+      ) as HTMLElement[];
+      for (const el of nameNodes) {
+        const t = normalize(el.innerText || el.textContent || "");
+        if (!t || paramNoise.test(t)) continue;
+        if (key(t) === want) return tryClick(el);
+      }
+      for (const el of nameNodes) {
+        const t = normalize(el.innerText || el.textContent || "");
+        if (!t || paramNoise.test(t)) continue;
+        if (key(t).startsWith(want) || want.startsWith(key(t))) {
+          return tryClick(el);
+        }
+      }
+
+      const items = Array.from(
+        list.querySelectorAll('[role="menuitem"],[role="menuitemradio"]'),
+      ) as HTMLElement[];
       for (const el of items) {
         const t = normalize(el.innerText || "").split("\n")[0] || "";
-        if (!t || /^auto$/i.test(t)) continue;
+        if (!t || paramNoise.test(t)) continue;
         if (el.getAttribute("aria-haspopup") === "menu") continue;
-        if (t.toLowerCase() === wantFull || key(t) === want) return tryClick(el);
+        if (el.getAttribute("data-component") === "menu-submenu-trigger") {
+          continue;
+        }
+        // Strip trailing badges like "RECOMMENDED".
+        const cleaned = t.replace(/\s+recommended$/i, "");
+        if (key(cleaned) === want || key(t) === want) return tryClick(el);
       }
       for (const el of items) {
-        const t = normalize(el.innerText || "").split("\n")[0] || "";
-        if (!t || /^auto$/i.test(t)) continue;
+        const t = normalize(el.innerText || "")
+          .split("\n")[0]
+          ?.replace(/\s+recommended$/i, "") || "";
+        if (!t || paramNoise.test(t)) continue;
         if (el.getAttribute("aria-haspopup") === "menu") continue;
+        if (el.getAttribute("data-component") === "menu-submenu-trigger") {
+          continue;
+        }
         if (key(t).startsWith(want) || want.startsWith(key(t))) {
           return tryClick(el);
         }
@@ -1453,7 +1663,12 @@ export class CdpDriver {
     }, modelLabel);
   }
 
-  /** Scrape Effort / Options / Context / etc from the open parameters panel. */
+  /**
+   * Scrape the open parameters panel (Cursor 2.x+ layout):
+   *   Fast            → menuitemcheckbox
+   *   Effort High     → submenu trigger (left=Effort, right=High)
+   *   Model <name>    → submenu trigger in footer
+   */
   private async scrapeParamsPanel(page: Page): Promise<{
     baseModel?: string;
     sections: Array<{
@@ -1463,122 +1678,166 @@ export class CdpDriver {
       options: Array<{ id: string; label: string; selected: boolean }>;
     }>;
   }> {
-    return page.evaluate(() => {
+    const summary = await page.evaluate(() => {
       const normalize = (s: string) =>
         s
           .replace(/[\u200b-\u200d\ufeff]/g, "")
           .replace(/\s+/g, " ")
           .trim();
-      const slug = (s: string) =>
-        normalize(s)
-          .toLowerCase()
-          .replace(/[^a-z0-9]+/g, "-")
-          .replace(/^-|-$/g, "");
-
       const menus = Array.from(document.querySelectorAll('[role="menu"]'));
       const menu =
+        menus.find(
+          (m) =>
+            m.getAttribute("data-testid") ===
+            "selected-model-parameters-submenu-menu",
+        ) ||
         menus.find((m) =>
           /parameters/i.test(m.getAttribute("aria-label") || ""),
         ) ||
         menus.find((m) =>
-          /Effort|Options|Context|Thinking/i.test(
+          /Effort|Context|Thinking|\bFast\b/i.test(
             (m as HTMLElement).innerText || "",
           ),
         );
-      if (!menu) return { sections: [] };
+      if (!menu) return { baseModel: undefined as string | undefined, toggles: [] as Array<{ label: string; selected: boolean }>, choices: [] as Array<{ title: string; current: string }> };
 
-      const sections: Array<{
-        id: string;
-        title: string;
-        kind: "choice" | "toggle";
-        options: Array<{ id: string; label: string; selected: boolean }>;
-      }> = [];
       let baseModel: string | undefined;
+      const toggles: Array<{ label: string; selected: boolean }> = [];
+      const choices: Array<{ title: string; current: string }> = [];
 
-      for (const group of Array.from(
-        menu.querySelectorAll('[role="group"], .ui-menu__section'),
+      for (const el of Array.from(
+        menu.querySelectorAll('[role="menuitemcheckbox"]'),
       )) {
-        const title = normalize(
-          (
-            group.querySelector(
-              '.ui-menu__section-title, [data-component="menu-section-title"]',
-            ) as HTMLElement | null
-          )?.innerText ||
-            group.getAttribute("aria-label") ||
-            "",
-        );
-        if (!title || /^model$/i.test(title)) {
-          const trigger = group.querySelector(
-            '[data-component="menu-submenu-trigger"],.ui-menu__submenu-trigger',
-          ) as HTMLElement | null;
-          if (trigger) {
-            baseModel =
-              normalize(trigger.innerText || "").split("\n")[0] || baseModel;
-          }
+        const label =
+          normalize((el as HTMLElement).innerText || "").split("\n")[0] || "";
+        if (!label) continue;
+        toggles.push({
+          label,
+          selected:
+            el.getAttribute("aria-checked") === "true" ||
+            el.getAttribute("data-checked") === "true",
+        });
+      }
+
+      for (const el of Array.from(
+        menu.querySelectorAll(
+          '[data-component="menu-submenu-trigger"], .ui-menu__submenu-trigger',
+        ),
+      )) {
+        const content = el.querySelector(
+          '[data-component="menu-item-content"], .ui-menu__item-content',
+        ) as HTMLElement | null;
+        const right = el.querySelector(
+          '[data-component="menu-item-right"], .ui-menu__item-right, [data-component="menu-submenu-right-section"]',
+        ) as HTMLElement | null;
+        const left = normalize(content?.innerText || "")
+          .split("\n")[0]
+          .split(/\s+/)[0];
+        const value = normalize(right?.innerText || "").split("\n")[0] || "";
+        if (!left) continue;
+        if (/^model$/i.test(left)) {
+          baseModel = value || baseModel;
           continue;
         }
-
-        const toggles: Array<{ id: string; label: string; selected: boolean }> =
-          [];
-        const choices: Array<{ id: string; label: string; selected: boolean }> =
-          [];
-
-        for (const n of Array.from(
-          group.querySelectorAll(
-            '[role="menuitem"],[role="menuitemcheckbox"],[role="menuitemradio"]',
-          ),
-        )) {
-          const el = n as HTMLElement;
-          if (el.getAttribute("aria-haspopup") === "menu") continue;
-          const label = normalize(el.innerText || "").split("\n")[0] || "";
-          if (!label || label.toLowerCase() === title.toLowerCase()) continue;
-          const role = el.getAttribute("role") || "";
-          if (role === "menuitemcheckbox") {
-            toggles.push({
-              id: slug(label),
-              label,
-              selected:
-                el.getAttribute("aria-checked") === "true" ||
-                el.getAttribute("data-checked") === "true",
-            });
-          } else {
-            const right = el.querySelector(
-              '[data-component="menu-item-right"]',
-            );
-            const selected = Boolean(
-              right &&
-                (right.querySelector("i, svg, [class*='check']") ||
-                  (right.textContent || "").trim()),
-            );
-            choices.push({
-              id: slug(label),
-              label,
-              selected,
-            });
-          }
-        }
-
-        if (toggles.length) {
-          sections.push({
-            id: slug(title) || "options",
-            title,
-            kind: "toggle",
-            options: toggles,
-          });
-        }
-        if (choices.length) {
-          // If nothing marked selected, leave all false — client can still pick.
-          sections.push({
-            id: slug(title) || "choices",
-            title,
-            kind: "choice",
-            options: choices,
-          });
+        if (
+          /^(effort|context|thinking|speed|verbosity|options|max)$/i.test(left)
+        ) {
+          choices.push({ title: left.replace(/^./, (c) => c.toUpperCase()), current: value });
         }
       }
 
-      return { baseModel, sections };
+      return { baseModel, toggles, choices };
     });
+
+    const sections: Array<{
+      id: string;
+      title: string;
+      kind: "choice" | "toggle";
+      options: Array<{ id: string; label: string; selected: boolean }>;
+    }> = [];
+
+    if (summary.toggles.length) {
+      sections.push({
+        id: "options",
+        title: "Options",
+        kind: "toggle",
+        options: summary.toggles.map((t) => ({
+          id: t.label.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
+          label: t.label,
+          selected: t.selected,
+        })),
+      });
+    }
+
+    // Expand each choice submenu to learn the full option list.
+    for (const choice of summary.choices) {
+      const opened = await this.openParamSubmenu(page, choice.title);
+      await new Promise((r) => setTimeout(r, 220));
+      let options = opened
+        ? await page.evaluate(() => {
+            const normalize = (s: string) =>
+              s
+                .replace(/[\u200b-\u200d\ufeff]/g, "")
+                .replace(/\s+/g, " ")
+                .trim();
+            const menus = Array.from(document.querySelectorAll('[role="menu"]'));
+            const sub =
+              menus.find((m) =>
+                /^parameter-submenu-/i.test(
+                  m.getAttribute("data-testid") || "",
+                ),
+              ) ||
+              menus.find((m) => m.hasAttribute("data-submenu")) ||
+              menus.find((m) =>
+                /options$/i.test(m.getAttribute("aria-label") || ""),
+              );
+            if (!sub) return [] as string[];
+            return Array.from(
+              sub.querySelectorAll(
+                '[role="menuitem"],[role="menuitemradio"],[role="option"]',
+              ),
+            )
+              .map((el) => {
+                if (el.getAttribute("aria-haspopup") === "menu") return "";
+                return (
+                  normalize((el as HTMLElement).innerText || "").split(
+                    "\n",
+                  )[0] || ""
+                );
+              })
+              .filter(Boolean);
+          })
+        : [];
+      // Close the nested submenu without dismissing the whole picker.
+      await page.keyboard.press("Escape").catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 120));
+
+      if (!options.length && choice.current) {
+        options = [choice.current];
+      }
+      // Ensure current value is present even if scrape missed selection state.
+      if (
+        choice.current &&
+        !options.some((o) => o.toLowerCase() === choice.current.toLowerCase())
+      ) {
+        options = [choice.current, ...options];
+      }
+
+      sections.push({
+        id: choice.title.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
+        title: choice.title,
+        kind: "choice",
+        options: options.map((label) => ({
+          id: label.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
+          label,
+          selected:
+            Boolean(choice.current) &&
+            label.toLowerCase() === choice.current.toLowerCase(),
+        })),
+      });
+    }
+
+    return { baseModel: summary.baseModel, sections };
   }
 
   async selectModel(
@@ -1604,7 +1863,11 @@ export class CdpDriver {
     choices?: Record<string, string>;
     toggles?: Record<string, boolean>;
   }): Promise<boolean> {
+    await activateCursorApp();
     const page = await this.ensurePage();
+    await this.activateCurrentPage();
+    await activateCursorApp();
+    await this.activateCurrentPage();
     return this.withLock(this.targetId || "default", async () => {
       const picker = await this.openModelPicker(page);
       if (!picker) return false;
@@ -1613,7 +1876,7 @@ export class CdpDriver {
       await this.expandModelSubmenu(page);
       const clicked = await this.clickModelInSubmenu(page, config.modelLabel);
       await page.keyboard.press("Escape").catch(() => undefined);
-      await new Promise((r) => setTimeout(r, 200));
+      await new Promise((r) => setTimeout(r, 250));
       if (!clicked) return false;
       if (isAuto) return true;
 
@@ -1626,10 +1889,22 @@ export class CdpDriver {
       const again = await this.openModelPicker(page);
       if (!again) return true;
 
-      for (const label of Object.values(choices)) {
+      for (const [section, label] of Object.entries(choices)) {
         if (!label) continue;
-        await this.clickMenuItemByLabel(page, label);
-        await new Promise((r) => setTimeout(r, 120));
+        // Section keys are titles ("Effort", "Context"); open that submenu
+        // then click the value — never click the Model trigger.
+        if (/^model$/i.test(section)) continue;
+        const opened = await this.openParamSubmenu(page, section);
+        await new Promise((r) => setTimeout(r, 200));
+        if (opened) {
+          await this.clickMenuItemByLabel(page, label, { scope: "params" });
+          await new Promise((r) => setTimeout(r, 120));
+          await page.keyboard.press("Escape").catch(() => undefined);
+          await new Promise((r) => setTimeout(r, 120));
+        } else {
+          // Fallback: value may be a top-level row.
+          await this.clickMenuItemByLabel(page, label, { scope: "params" });
+        }
       }
 
       for (const [label, wantOn] of Object.entries(toggles)) {
@@ -1648,7 +1923,10 @@ export class CdpDriver {
         }, label);
         if (current == null) continue;
         if (current !== wantOn) {
-          await this.clickMenuItemByLabel(page, label, { checkbox: true });
+          await this.clickMenuItemByLabel(page, label, {
+            checkbox: true,
+            scope: "params",
+          });
           await new Promise((r) => setTimeout(r, 120));
         }
       }
@@ -1681,13 +1959,8 @@ export class CdpDriver {
         );
       }
 
-      const currentParams = await this.scrapeParamsPanel(page);
-      const triggerText = await page
-        .$eval(picker, (el) =>
-          ((el as HTMLElement).innerText || "").trim().split("\n")[0],
-        )
-        .catch(() => undefined);
-
+      // Model list first — scrapeParamsPanel opens Effort/Context submenus
+      // and Escapes, which must not run before we expand the Model row.
       await this.expandModelSubmenu(page);
 
       const scraped = await page.evaluate(() => {
@@ -1729,7 +2002,7 @@ export class CdpDriver {
           ].map((s) => s.toLowerCase()),
         );
         const pushUnique = (arr: string[], raw: string) => {
-          const s = normalize(raw);
+          const s = normalize(raw).replace(/\s+recommended$/i, "").trim();
           if (!s || s.length > 90) return;
           const lower = s.toLowerCase();
           if (noise.has(lower)) return;
@@ -1739,8 +2012,12 @@ export class CdpDriver {
           arr.push(s);
         };
         const models: string[] = [];
+        const list =
+          document.querySelector(
+            '[data-testid="selected-model-list-submenu"]',
+          ) || document;
         const hasAuto = Array.from(
-          document.querySelectorAll('[role="menuitem"]'),
+          list.querySelectorAll('[role="menuitem"]'),
         ).some((n) =>
           /^auto$/i.test(
             normalize((n as HTMLElement).innerText || "").split("\n")[0] || "",
@@ -1749,7 +2026,7 @@ export class CdpDriver {
         if (hasAuto) models.push("Auto");
 
         const nameNodes = Array.from(
-          document.querySelectorAll(
+          list.querySelectorAll(
             ".ui-model-picker__item-content-name, [class*='model-picker__item-content-name']",
           ),
         ) as HTMLElement[];
@@ -1758,10 +2035,13 @@ export class CdpDriver {
         }
         if (models.filter((m) => !/^auto$/i.test(m)).length === 0) {
           for (const node of Array.from(
-            document.querySelectorAll('[role="menuitem"]'),
+            list.querySelectorAll('[role="menuitem"]'),
           )) {
             const el = node as HTMLElement;
             if (el.getAttribute("aria-haspopup") === "menu") continue;
+            if (el.getAttribute("data-component") === "menu-submenu-trigger") {
+              continue;
+            }
             const first = normalize(el.innerText || "").split("\n")[0] || "";
             if (first) pushUnique(models, first);
           }
@@ -1769,13 +2049,36 @@ export class CdpDriver {
         return { models };
       });
 
+      // Close model list; reopen parameters panel if Escape dismissed it.
+      await page.keyboard.press("Escape").catch(() => undefined);
+      await new Promise((r) => setTimeout(r, 150));
+      const stillOpen = await page.evaluate(
+        () =>
+          Boolean(
+            document.querySelector(
+              '[data-testid="selected-model-parameters-submenu-menu"]',
+            ) ||
+              Array.from(document.querySelectorAll('[role="menu"]')).some((m) =>
+                /parameters/i.test(m.getAttribute("aria-label") || ""),
+              ),
+          ),
+      );
+      if (!stillOpen) {
+        await this.openModelPicker(page);
+      }
+
+      const currentParams = await this.scrapeParamsPanel(page);
+      // Chip often shows effort/speed ("High Fast"), not the model name.
+      const current =
+        currentParams.baseModel ||
+        (await page
+          .$eval(picker, (el) =>
+            ((el as HTMLElement).innerText || "").trim().split("\n")[0],
+          )
+          .catch(() => undefined));
+
       await page.keyboard.press("Escape");
       await new Promise((r) => setTimeout(r, 150));
-
-      const current =
-        currentParams.baseModel && triggerText
-          ? triggerText
-          : currentParams.baseModel || triggerText;
 
       return {
         models: scraped.models,
@@ -1829,7 +2132,8 @@ export class CdpDriver {
       const scraped = await this.scrapeParamsPanel(page);
       await page.keyboard.press("Escape").catch(() => undefined);
       return {
-        modelLabel: triggerText || modelLabel || scraped.baseModel || "unknown",
+        modelLabel:
+          scraped.baseModel || triggerText || modelLabel || "unknown",
         baseModel: scraped.baseModel,
         sections: scraped.sections,
       };

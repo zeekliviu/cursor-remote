@@ -324,7 +324,13 @@ export class ApiClient {
     text: string,
     submit = true,
     attachmentPaths: string[] = [],
-    opts?: { projectId?: string; chatName?: string; chatId?: string },
+    opts?: {
+      projectId?: string;
+      chatName?: string;
+      chatId?: string;
+      /** Ctrl/Cmd+Enter — bypass Cursor's queue and send immediately. */
+      force?: boolean;
+    },
   ) {
     return this.request<{ ok: boolean }>("/composer/send", {
       method: "POST",
@@ -335,6 +341,7 @@ export class ApiClient {
         projectId: opts?.projectId,
         chatName: opts?.chatName,
         chatId: opts?.chatId,
+        force: opts?.force,
       }),
     });
   }

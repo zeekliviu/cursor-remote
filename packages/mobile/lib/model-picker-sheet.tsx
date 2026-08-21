@@ -399,10 +399,10 @@ export function ModelPickerSheet({
     else if (Date.now() - latest.current.cachedAt > STALE_MS) void refresh(true);
   }, [hostModelLabel, hydrated, open, refresh, selectLabel]);
 
-  /** First time a model is used, remember which options Cursor offers for it. */
+  /** Refresh options for the active model and show them in the open sheet. */
   const learnParams = useCallback(
     async (label: string) => {
-      if (!client || latest.current.paramsByModel[key(label)]?.length) return;
+      if (!client) return;
       try {
         const p = await client.modelParams();
         if (!p?.sections?.length) return;
@@ -410,7 +410,15 @@ export function ModelPickerSheet({
           ...latest.current.paramsByModel,
           [key(label)]: p.sections,
         };
+        const init = initialFromSections(p.sections);
         setParamsByModel(nextParams);
+        // Keep the sheet in sync so Effort/Context/Fast appear immediately.
+        if (key(latest.current.selected) === key(label)) {
+          setSections(p.sections);
+          setChoices(init.choices);
+          setToggles(init.toggles);
+          setBaseline(stateKey(p.sections, init.choices, init.toggles));
+        }
         persist({
           models: latest.current.models,
           current: label,

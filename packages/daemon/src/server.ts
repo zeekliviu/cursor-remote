@@ -405,7 +405,9 @@ ${qrDataUrl ? `<p><img alt="pairing qr" src="${qrDataUrl}"/></p>` : ""}
           return;
         }
       }
-      await cdp.sendMessage(full, req.body?.submit !== false);
+      await cdp.sendMessage(full, req.body?.submit !== false, {
+        force: Boolean(req.body?.force),
+      });
       if (chatId) composerMonitor.setActiveChat(chatId);
       composerMonitor.wake();
       res.json({ ok: true });
@@ -663,7 +665,9 @@ function handleComposerWs(
         return;
       }
       if (msg.type === "send") {
-        await cdp.sendMessage(msg.text, msg.submit !== false);
+        await cdp.sendMessage(msg.text, msg.submit !== false, {
+          force: Boolean(msg.force),
+        });
         monitor.wake();
         sendComposer(ws, {
           type: "event",
