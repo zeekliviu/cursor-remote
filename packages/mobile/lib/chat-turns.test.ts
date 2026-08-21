@@ -133,6 +133,8 @@ test("classifyToolName supports stored and current tool spellings", () => {
     ["todo_write", "PlanTodos"],
     ["UpdateCurrentStep", "PlanTodos"],
     ["Subagent", "Subagent"],
+    ["task_v2", "Subagent"],
+    ["Task", "Subagent"],
     ["unknown_action", "Other"],
   ] as const;
 

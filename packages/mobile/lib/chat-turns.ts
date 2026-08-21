@@ -130,7 +130,8 @@ export function classifyToolName(rawName?: string | null): ToolCategory {
       "launch_agent",
       "background_agent",
     ]) ||
-    name === "task"
+    name === "task" ||
+    name.startsWith("task_")
   ) {
     return "Subagent";
   }

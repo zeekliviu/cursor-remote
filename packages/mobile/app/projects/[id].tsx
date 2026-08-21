@@ -70,6 +70,12 @@ export default function ProjectScreen() {
     refresh();
   }, [refresh]);
 
+  // Selecting a project on the phone should un-minimize / focus Cursor on the host.
+  useEffect(() => {
+    if (!client || !id) return;
+    client.openProject(id).catch(() => undefined);
+  }, [client, id]);
+
   const openInCursor = useCallback(async () => {
     if (!client || !id) return;
     setOpening(true);
@@ -217,14 +223,30 @@ export default function ProjectScreen() {
             </View>
           </View>
           <Text style={styles.cardMeta}>
-            {c.mode || "agent"}
-            {c.subagentIds?.length
-              ? ` · ${c.subagentIds.length} ${c.subagentIds.length === 1 ? "subagent" : "subagents"}`
-              : ""}
-            {!canMessage ? " · explore transcript" : ""}
-            {c.lastUpdatedAt
-              ? ` · ${new Date(c.lastUpdatedAt).toLocaleString()}`
-              : ""}
+            {[
+              c.isSubagent
+                ? c.subagentType
+                  ? c.subagentType.replace(/([a-z])([A-Z])/g, "$1 $2")
+                  : "subagent"
+                : c.mode || "agent",
+              c.model
+                ? /^default$/i.test(c.model)
+                  ? "Auto"
+                  : c.model
+                : null,
+              c.status && c.status !== "none" ? c.status : null,
+              c.subagentIds?.length
+                ? `${c.subagentIds.length} ${
+                    c.subagentIds.length === 1 ? "subagent" : "subagents"
+                  }`
+                : null,
+              !canMessage && !c.isSubagent ? "explore transcript" : null,
+              c.lastUpdatedAt
+                ? new Date(c.lastUpdatedAt).toLocaleString()
+                : null,
+            ]
+              .filter(Boolean)
+              .join(" · ")}
           </Text>
         </Pressable>
       </Link>

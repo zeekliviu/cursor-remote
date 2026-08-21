@@ -19,6 +19,8 @@ type ComposerData = {
   createdAt?: number;
   lastUpdatedAt?: number;
   unifiedMode?: string;
+  status?: string;
+  subtitle?: string;
   filesChangedCount?: number;
   isDraft?: boolean;
   isAgentic?: boolean;
@@ -27,6 +29,18 @@ type ComposerData = {
   isSpec?: boolean;
   subComposerIds?: string[];
   subagentComposerIds?: string[];
+  modelConfig?: {
+    modelName?: string;
+    maxMode?: boolean;
+    selectedModels?: Array<{ modelId?: string; parameters?: unknown[] }>;
+  };
+  subagentInfo?: {
+    subagentType?: number | string;
+    subagentTypeName?: string;
+    parentComposerId?: string;
+    rootParentConversationId?: string;
+    additionalData?: Record<string, unknown>;
+  };
   newlyCreatedFiles?: Array<{ uri?: { fsPath?: string; path?: string; external?: string } }>;
   originalFileStates?: Record<
     string,
@@ -46,6 +60,29 @@ type ComposerData = {
     createdAt?: string;
   }>;
 };
+
+function composerModelLabel(data: ComposerData | undefined): string | undefined {
+  if (!data?.modelConfig) return undefined;
+  const selected = data.modelConfig.selectedModels?.find((m) => m?.modelId)?.modelId;
+  const raw = selected || data.modelConfig.modelName;
+  if (!raw || typeof raw !== "string") return undefined;
+  return raw.trim() || undefined;
+}
+
+function composerSubagentType(data: ComposerData | undefined): string | undefined {
+  const named = data?.subagentInfo?.subagentTypeName;
+  if (typeof named === "string" && named.trim()) return named.trim();
+  const typed = data?.subagentInfo?.subagentType;
+  if (typeof typed === "string" && typed.trim()) return typed.trim();
+  return undefined;
+}
+
+function composerParentId(data: ComposerData | undefined): string | undefined {
+  const parent =
+    data?.subagentInfo?.parentComposerId ||
+    data?.subagentInfo?.rootParentConversationId;
+  return typeof parent === "string" && parent.trim() ? parent.trim() : undefined;
+}
 
 function openReadonly(dbPath: string): Database.Database | null {
   if (!fs.existsSync(dbPath)) return null;
@@ -486,6 +523,10 @@ export class CursorStore {
       else list = this.chatsFromSearchIndex(projectId);
     }
 
+    // Workspace allComposers often omits nested subagents — merge them in
+    // from global composerData so they remain openable from the project list.
+    list = this.mergeMissingSubagentChats(list, projectId, project.path, childIds);
+
     return this.annotateMessageable(list, childIds).sort((a, b) => {
       // Messageable first, then recency
       if (Boolean(a.messageable) !== Boolean(b.messageable)) {
@@ -628,6 +669,7 @@ export class CursorStore {
               startedAt?: number;
               finishedAt?: number;
               statusKind?: "pending" | "running" | "completed" | "error" | "cancelled";
+              subagentComposerId?: string;
             }
           | undefined;
 
@@ -782,6 +824,24 @@ export class CursorStore {
             startedAt,
             finishedAt,
             statusKind,
+            subagentComposerId: (() => {
+              const fromAdd = add.subagentComposerId;
+              if (typeof fromAdd === "string" && fromAdd.trim()) {
+                return fromAdd.trim();
+              }
+              const fromResult = resultObj?.agentId ?? resultObj?.composerId;
+              if (typeof fromResult === "string" && fromResult.trim()) {
+                return fromResult.trim();
+              }
+              const fromParams =
+                paramsObj?.subagentComposerId ??
+                paramsObj?.agentId ??
+                paramsObj?.composerId;
+              if (typeof fromParams === "string" && fromParams.trim()) {
+                return fromParams.trim();
+              }
+              return undefined;
+            })(),
           };
         }
 
@@ -874,9 +934,12 @@ export class CursorStore {
         createdAt: data.createdAt,
         lastUpdatedAt: data.lastUpdatedAt,
         mode: data.unifiedMode,
+        model: composerModelLabel(data),
+        subagentType: composerSubagentType(data),
+        status: typeof data.status === "string" ? data.status : undefined,
         messageable,
         isSubagent: childIds.has(chatId) || Boolean(data.isBestOfNSubcomposer),
-        parentChatId,
+        parentChatId: parentChatId || composerParentId(data),
         subagentIds: subagentIds.length ? subagentIds : undefined,
         messages: withImages,
         filesChangedCount: filesChanged.length || undefined,
@@ -1123,23 +1186,47 @@ export class CursorStore {
         db.close();
       }
     }
-    return list.map((c) => ({
-      ...c,
-      messageable: this.isMessageableComposer(c.id, dataById.get(c.id), childIds),
-      isSubagent:
-        childIds.has(c.id) ||
-        Boolean(dataById.get(c.id)?.isBestOfNSubcomposer),
-      subagentIds: (() => {
-        const data = dataById.get(c.id);
-        const ids = Array.from(
-          new Set([
-            ...(data?.subagentComposerIds || []),
-            ...(data?.subComposerIds || []),
-          ]),
-        ).filter(Boolean);
-        return ids.length ? ids : undefined;
-      })(),
-    }));
+    return list.map((c) => {
+      const data = dataById.get(c.id);
+      const ids = Array.from(
+        new Set([
+          ...(data?.subagentComposerIds || []),
+          ...(data?.subComposerIds || []),
+        ]),
+      ).filter(Boolean);
+      return {
+        ...c,
+        messageable: this.isMessageableComposer(c.id, data, childIds),
+        isSubagent:
+          childIds.has(c.id) || Boolean(data?.isBestOfNSubcomposer),
+        parentChatId: c.parentChatId || composerParentId(data),
+        model: c.model || composerModelLabel(data),
+        subagentType: c.subagentType || composerSubagentType(data),
+        status:
+          c.status ||
+          (typeof data?.status === "string" ? data.status : undefined),
+        subagentIds: ids.length ? ids : c.subagentIds,
+      };
+    });
+  }
+
+  /**
+   * Ensure every known subagent under this project's composers appears in the
+   * chat list, even when workspace `allComposers` omitted them.
+   */
+  private mergeMissingSubagentChats(
+    list: ChatSummary[],
+    projectId: string,
+    projectPath: string,
+    childIds: Set<string>,
+  ): ChatSummary[] {
+    if (childIds.size === 0) return list;
+    const known = new Set(list.map((c) => c.id));
+    const extras = this.chatsFromGlobalComposerData(projectId, projectPath).filter(
+      (c) => childIds.has(c.id) && !known.has(c.id),
+    );
+    if (extras.length === 0) return list;
+    return [...list, ...extras];
   }
 
   private chatsFromWorkspaceDb(projectId: string): ChatSummary[] {
@@ -1212,6 +1299,10 @@ export class CursorStore {
           createdAt: data.createdAt,
           lastUpdatedAt: data.lastUpdatedAt,
           mode: data.unifiedMode,
+          model: composerModelLabel(data),
+          subagentType: composerSubagentType(data),
+          status: typeof data.status === "string" ? data.status : undefined,
+          parentChatId: composerParentId(data),
         });
       }
       return out.sort((a, b) => (b.lastUpdatedAt || 0) - (a.lastUpdatedAt || 0));

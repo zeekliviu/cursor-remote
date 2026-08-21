@@ -20,6 +20,7 @@ type Props = {
   density: ChatDensity;
   initiallyExpanded?: boolean;
   onOpenTerminal?: () => void;
+  onOpenSubagent?: (composerId: string) => void;
   onQuickPrompt?: (prompt: string) => void;
   isExpanded: (id: string, defaultExpanded?: boolean) => boolean;
   onToggleExpanded: (id: string, defaultExpanded?: boolean) => void;
@@ -70,22 +71,27 @@ function summaryFor(category: ToolCategory, messages: ChatMessage[]): string {
 const ToolRow = memo(function ToolRow({
   message,
   onOpenTerminal,
+  onOpenSubagent,
   onQuickPrompt,
   open,
   onToggle,
 }: {
   message: ChatMessage;
   onOpenTerminal?: () => void;
+  onOpenSubagent?: (composerId: string) => void;
   onQuickPrompt?: (prompt: string) => void;
   open: boolean;
   onToggle: () => void;
 }) {
   const formatted = useMemo(() => formatToolMessage(message), [message]);
+  const subagentId =
+    formatted.subagentComposerId || message.tool?.subagentComposerId;
   const hasDetails = Boolean(
     formatted.detail ||
       formatted.result ||
       formatted.diffPatch ||
-      formatted.output,
+      formatted.output ||
+      subagentId,
   );
   const failed =
     (formatted.exitCode != null && formatted.exitCode !== 0) ||
@@ -95,15 +101,34 @@ const ToolRow = memo(function ToolRow({
   return (
     <View style={[styles.toolRow, failed && styles.toolRowFailed]}>
       <Pressable
-        onPress={() => hasDetails && onToggle()}
+        onPress={() => {
+          if (subagentId && onOpenSubagent) {
+            onOpenSubagent(subagentId);
+            return;
+          }
+          if (hasDetails) onToggle();
+        }}
         style={styles.toolMain}
-        accessibilityRole={hasDetails ? "button" : undefined}
+        accessibilityRole={hasDetails || subagentId ? "button" : undefined}
         accessibilityState={hasDetails ? { expanded: open } : undefined}
+        accessibilityLabel={
+          subagentId
+            ? `Open subagent ${formatted.title}`
+            : formatted.title
+        }
       >
-        <Text style={[styles.toolTitle, failed && styles.failedText]}>
-          {hasDetails ? (open ? "⌄ " : "› ") : ""}
-          {formatted.title}
-        </Text>
+        <View style={styles.toolTextCol}>
+          <Text style={[styles.toolTitle, failed && styles.failedText]}>
+            {hasDetails && !subagentId ? (open ? "⌄ " : "› ") : ""}
+            {subagentId ? "↗ " : ""}
+            {formatted.title}
+          </Text>
+          {!open && formatted.detail ? (
+            <Text style={styles.toolSubtitle} numberOfLines={2}>
+              {formatted.detail}
+            </Text>
+          ) : null}
+        </View>
         {formatted.status ? (
           <Text style={styles.status}>{formatted.status}</Text>
         ) : formatted.exitCode != null ? (
@@ -147,6 +172,15 @@ const ToolRow = memo(function ToolRow({
               {formatted.output}
             </Text>
           ) : null}
+          {subagentId && onOpenSubagent ? (
+            <Pressable
+              onPress={() => onOpenSubagent(subagentId)}
+              style={styles.openTerminal}
+              accessibilityRole="button"
+            >
+              <Text style={styles.openTerminalText}>Open subagent chat</Text>
+            </Pressable>
+          ) : null}
           {/terminal|shell|command/i.test(message.tool?.name || "") &&
           onOpenTerminal ? (
             <Pressable
@@ -180,6 +214,7 @@ export const ToolCluster = memo(function ToolCluster({
   density,
   initiallyExpanded,
   onOpenTerminal,
+  onOpenSubagent,
   onQuickPrompt,
   isExpanded,
   onToggleExpanded,
@@ -191,7 +226,10 @@ export const ToolCluster = memo(function ToolCluster({
       /error|failed/i.test(message.tool?.status || ""),
   );
   const defaultExpanded = Boolean(
-    initiallyExpanded || density === "detailed" || hasFailure,
+    initiallyExpanded ||
+      density === "detailed" ||
+      hasFailure ||
+      category === "Subagent",
   );
   const expanded = isExpanded(clusterId, defaultExpanded);
   const showRows = expanded;
@@ -214,6 +252,7 @@ export const ToolCluster = memo(function ToolCluster({
               key={message.id}
               message={message}
               onOpenTerminal={onOpenTerminal}
+              onOpenSubagent={onOpenSubagent}
               onQuickPrompt={onQuickPrompt}
               open={isExpanded(`tool-detail-${message.id}`, false)}
               onToggle={() =>
@@ -253,7 +292,9 @@ const styles = StyleSheet.create({
     justifyContent: "space-between",
     gap: 8,
   },
-  toolTitle: { flex: 1, color: "#312d27", fontSize: 12, fontWeight: "600" },
+  toolTitle: { color: "#312d27", fontSize: 12, fontWeight: "600" },
+  toolTextCol: { flex: 1, gap: 2 },
+  toolSubtitle: { color: "#81786b", fontSize: 11 },
   failedText: { color: "#94483f" },
   status: { color: "#81786b", fontSize: 10 },
   details: { paddingHorizontal: 12, paddingBottom: 10, gap: 5 },

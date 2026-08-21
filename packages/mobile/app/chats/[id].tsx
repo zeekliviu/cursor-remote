@@ -251,6 +251,14 @@ export default function ChatScreen() {
   const scrollRef = useRef<FlatList<ChatTurn>>(null);
   const lastLenRef = useRef(0);
   const nearBottomRef = useRef(true);
+  /**
+   * True while a chat is opening. During this window we ignore user-scroll
+   * signals and aggressively re-pin to the bottom on every content-size
+   * change so that opening a long transcript never lands mid-conversation.
+   * FlatList lazy-renders items in windows, so a single `scrollToEnd` call
+   * often lands at the current partial bottom before more items mount.
+   */
+  const initialLoadRef = useRef(true);
   const projectIdParam = typeof projectId === "string" ? projectId : undefined;
   const hostId = client
     ? client.connection.id ||
@@ -332,29 +340,48 @@ export default function ChatScreen() {
     !busy &&
     !interrupting &&
     (draft.trim().length > 0 || attaches.length > 0);
-  const showJumpPill = !atBottom && (newCount > 0 || agentRunning);
+  /**
+   * Always offer a way to jump when the user isn't at the tail — including
+   * the mid-conversation open case where no new messages have arrived and
+   * the agent is idle.
+   */
+  const showJumpPill = !atBottom;
 
-  const scrollBottom = useCallback(() => {
+  const scrollBottom = useCallback((animated = true) => {
     requestAnimationFrame(() =>
-      scrollRef.current?.scrollToEnd({ animated: true }),
+      scrollRef.current?.scrollToEnd({ animated }),
     );
   }, []);
 
-  /** Auto-scroll only while the user is actually following the tail. */
+  /**
+   * Called on content-size grow and during live streaming. While the chat
+   * is still opening we always re-pin to the bottom (no animation, so it
+   * looks like the chat "just opened at the latest" instead of scrolling).
+   * After the initial-load window closes we only follow when the user is
+   * still near the tail.
+   */
   const followBottom = useCallback(() => {
+    if (initialLoadRef.current) {
+      scrollBottom(false);
+      return;
+    }
     if (!nearBottomRef.current) return;
-    scrollBottom();
+    scrollBottom(true);
   }, [scrollBottom]);
 
   const jumpToLatest = useCallback(() => {
     nearBottomRef.current = true;
     setAtBottom(true);
     setNewCount(0);
-    scrollBottom();
+    scrollBottom(true);
   }, [scrollBottom]);
 
   const onScroll = useCallback(
     (e: NativeSyntheticEvent<NativeScrollEvent>) => {
+      // Ignore layout-driven scrolls during the open animation — otherwise
+      // FlatList's lazy renders (which briefly report contentSize < real
+      // size) flip nearBottomRef to false and freeze the chat mid-scroll.
+      if (initialLoadRef.current) return;
       const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
       const distance =
         contentSize.height - contentOffset.y - layoutMeasurement.height;
@@ -365,6 +392,23 @@ export default function ChatScreen() {
     },
     [],
   );
+
+  // Reset the "opening" pin whenever the visible chat changes. 1200ms is
+  // enough for FlatList to mount + render a couple of lazy batches; after
+  // that we honor the user's real scroll position.
+  useEffect(() => {
+    initialLoadRef.current = true;
+    nearBottomRef.current = true;
+    setAtBottom(true);
+    setNewCount(0);
+    const timer = setTimeout(() => {
+      initialLoadRef.current = false;
+      // One last scroll after the pin releases in case FlatList grew again
+      // in the final tick before we stopped forcing the tail.
+      scrollBottom(false);
+    }, 1200);
+    return () => clearTimeout(timer);
+  }, [id, scrollBottom]);
 
   const applyChatUpdate = useCallback((detail: ChatDetail) => {
     // Counted outside the updater so a re-invoked updater can't double-count.
@@ -429,13 +473,32 @@ export default function ChatScreen() {
 
   // The header carries identity + live agent status next to the message count.
   const headerSubtitle = useMemo(() => {
+    const model =
+      chat?.model && !/^default$/i.test(chat.model)
+        ? chat.model
+        : chat?.model
+          ? "Auto"
+          : null;
+    const type = chat?.subagentType
+      ? chat.subagentType.replace(/([a-z])([A-Z])/g, "$1 $2")
+      : null;
     const parts = [
       projectName,
       messageable ? null : "view only",
+      type,
+      model,
+      chat?.status && /running|pending/i.test(chat.status) ? chat.status : null,
       chat?.messages.length ? `${chat.messages.length} msg` : null,
     ].filter(Boolean);
     return parts.length ? parts.join(" · ") : null;
-  }, [projectName, messageable, chat?.messages.length]);
+  }, [
+    projectName,
+    messageable,
+    chat?.messages.length,
+    chat?.model,
+    chat?.subagentType,
+    chat?.status,
+  ]);
 
   const headerStatus = agentStatus || (busy ? live || "Working…" : null);
   const openDensityMenu = useCallback(() => {
@@ -547,8 +610,30 @@ export default function ChatScreen() {
     return () => clearTimeout(t);
   }, [id, draft]);
 
+  // Un-minimize / focus Cursor immediately on chat open (don't wait for chat name).
+  useEffect(() => {
+    if (!client) return;
+    if (typeof projectId === "string" && projectId) {
+      client.openProject(projectId).catch(() => undefined);
+      return;
+    }
+    client
+      .selectComposer({
+        chatId: typeof id === "string" ? id : undefined,
+      })
+      .catch(() => undefined);
+  }, [client, id, projectId]);
+
   useEffect(() => {
     if (!client || !chat?.name) return;
+    // Subagent / explore transcripts are view-only in Cursor's Agents panel —
+    // skip CDP chat bind (often fails) and just keep the project focused.
+    if (chat.messageable === false) {
+      if (typeof projectId === "string" && projectId) {
+        client.openProject(projectId).catch(() => undefined);
+      }
+      return;
+    }
     let cancelled = false;
     client
       .selectComposer({
@@ -588,7 +673,7 @@ export default function ChatScreen() {
     return () => {
       cancelled = true;
     };
-  }, [client, chat?.name, projectId, id]);
+  }, [client, chat?.name, chat?.messageable, projectId, id]);
 
   useEffect(() => {
     if (!bindHint || /failed|not found|error/i.test(bindHint)) return;
@@ -991,6 +1076,14 @@ export default function ChatScreen() {
                         `/terminal/${projectIdParam || chat.projectId}`,
                       )
                     }
+                    onOpenSubagent={(composerId) => {
+                      const q = projectIdParam || chat.projectId;
+                      router.push(
+                        `/chats/${composerId}${
+                          q ? `?projectId=${encodeURIComponent(q)}` : ""
+                        }`,
+                      );
+                    }}
                     onQuickPrompt={(prompt) => setDraft(prompt)}
                   />
                 );
@@ -1070,9 +1163,14 @@ export default function ChatScreen() {
               <View style={styles.readonlyBanner}>
                 <Text style={styles.readonlyTitle}>View only</Text>
                 <Text style={styles.readonlyBody}>
-                  This is a subagent / explore transcript. Cursor has no
-                  Composer input here — open a parent agent chat to send
-                  messages.
+                  {chat.subagentType
+                    ? `Subagent · ${chat.subagentType.replace(/([a-z])([A-Z])/g, "$1 $2")}`
+                    : "This is a subagent / explore transcript"}
+                  {chat.model
+                    ? ` · ${/^default$/i.test(chat.model) ? "Auto" : chat.model}`
+                    : ""}
+                  . Cursor has no Composer input here — open a parent agent chat
+                  to send messages.
                 </Text>
                 {chat.parentChatId ? (
                   <Pressable

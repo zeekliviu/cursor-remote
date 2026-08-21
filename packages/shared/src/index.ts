@@ -12,6 +12,12 @@ export type ChatSummary = {
   createdAt?: number;
   lastUpdatedAt?: number;
   mode?: string;
+  /** Resolved model id/label when known (e.g. from modelConfig). */
+  model?: string;
+  /** Subagent kind: explore, generalPurpose, shell, … */
+  subagentType?: string;
+  /** Composer status: running, completed, … */
+  status?: string;
   isArchived?: boolean;
   parentChatId?: string;
   subagentIds?: string[];
@@ -44,6 +50,8 @@ export type ChatMessage = {
     startedAt?: number;
     finishedAt?: number;
     statusKind?: "pending" | "running" | "completed" | "error" | "cancelled";
+    /** Linked child composer for task/subagent tools. */
+    subagentComposerId?: string;
   };
   /** Assistant reasoning / "Thought for Ns" body */
   thinking?: string;
@@ -226,7 +234,7 @@ export type ComposerClientMessage =
   | { type: "subscribe"; targetId?: string }
   | { type: "subscribeChat"; chatId: string; revision?: string }
   | { type: "unsubscribeChat"; chatId: string }
-  | { type: "send"; text: string; submit?: boolean }
+  | { type: "send"; text: string; submit?: boolean; force?: boolean }
   | { type: "selectChat"; chatName?: string; chatId?: string }
   | { type: "selectModel"; modelLabel: string }
   | { type: "confirm"; confirmationId: string; actionId: string }

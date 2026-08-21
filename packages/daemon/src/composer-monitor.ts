@@ -80,6 +80,9 @@ function chatMetadataChanged(previous: ChatDetail, next: ChatDetail): boolean {
     previous.name !== next.name ||
     previous.createdAt !== next.createdAt ||
     previous.mode !== next.mode ||
+    previous.model !== next.model ||
+    previous.subagentType !== next.subagentType ||
+    previous.status !== next.status ||
     previous.isArchived !== next.isArchived ||
     previous.messageable !== next.messageable ||
     previous.isSubagent !== next.isSubagent ||

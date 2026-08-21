@@ -22,7 +22,7 @@ export function classifyToolMessage(message: ChatMessage): ToolCategory {
   if (/web|fetch|browser|navigate|screenshot/.test(name)) return "web";
   if (/edit|write|patch|delete|create_file|strreplace/.test(name)) return "edit";
   if (/terminal|shell|command|awaitshell/.test(name)) return "terminal";
-  if (/subagent|task|best.of.n|bugbot|security.review/.test(name)) {
+  if (/subagent|best.of.n|bugbot|security.review|^task(_v\d+)?$/i.test(name)) {
     return "subagent";
   }
   if (/todo|plan|mode|question/.test(name)) return "plan";
@@ -75,7 +75,76 @@ export type FormattedTool = {
   exitCode?: number;
   diffPatch?: string;
   output?: string;
+  /** Child composer id for task/subagent tools — openable in-app. */
+  subagentComposerId?: string;
 };
+
+function prettySubagentType(raw?: string): string | undefined {
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed || /^unspecified$/i.test(trimmed)) return undefined;
+  if (trimmed === "generalPurpose" || trimmed === "general-purpose") {
+    return "general purpose";
+  }
+  return trimmed.replace(/[_-]+/g, " ");
+}
+
+function prettyModel(raw?: string): string | undefined {
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  if (!trimmed) return undefined;
+  if (/^default$/i.test(trimmed)) return "Auto";
+  return trimmed;
+}
+
+function taskSubagentId(
+  params: Record<string, unknown> | null,
+  result: unknown,
+  message: ChatMessage,
+): string | undefined {
+  if (message.tool?.subagentComposerId) return message.tool.subagentComposerId;
+  const fromParams =
+    params?.subagentComposerId ?? params?.agentId ?? params?.composerId;
+  if (typeof fromParams === "string" && fromParams.trim()) {
+    return fromParams.trim();
+  }
+  if (result && typeof result === "object") {
+    const obj = result as Record<string, unknown>;
+    const id = obj.agentId ?? obj.composerId ?? obj.subagentComposerId;
+    if (typeof id === "string" && id.trim()) return id.trim();
+  }
+  return undefined;
+}
+
+function formatTaskTool(
+  m: ChatMessage,
+  params: Record<string, unknown> | null,
+  result: unknown,
+  base: Omit<FormattedTool, "title" | "detail" | "result" | "subagentComposerId">,
+): FormattedTool {
+  const description = str(params?.description || params?.name || params?.title);
+  const typeLabel =
+    prettySubagentType(str(params?.subagentTypeName || params?.subagentType)) ||
+    prettySubagentType(str(params?.name));
+  const modelLabel = prettyModel(str(params?.model || params?.modelName));
+  const subagentComposerId = taskSubagentId(params, result, m);
+  const running =
+    m.tool?.statusKind === "running" ||
+    m.tool?.statusKind === "pending" ||
+    /running|pending/i.test(m.tool?.status || "");
+  const bits = [typeLabel, modelLabel].filter(Boolean);
+  return {
+    ...base,
+    title: description || (running ? "Subagent running" : "Subagent"),
+    detail: bits.length ? bits.join(" · ") : undefined,
+    result: subagentComposerId
+      ? running
+        ? "Open live transcript"
+        : "Open transcript"
+      : undefined,
+    subagentComposerId,
+  };
+}
 
 /** Turn a tool bubble into a short human-readable summary. */
 export function formatToolMessage(m: ChatMessage): FormattedTool {
@@ -243,13 +312,11 @@ export function formatToolMessage(m: ChatMessage): FormattedTool {
         detail: str(params?.target_mode_id || params?.mode),
       };
     }
-    case "Subagent": {
-      const description = str(params?.description);
-      return {
-        ...base,
-        title: status === "running" ? "Subagent running" : "Subagent",
-        detail: description || str(params?.prompt).slice(0, 140) || undefined,
-      };
+    case "Subagent":
+    case "task_v2":
+    case "task":
+    case "Task": {
+      return formatTaskTool(m, params, result, base);
     }
     case "AskQuestion": {
       const questions = Array.isArray(params?.questions)
@@ -271,6 +338,9 @@ export function formatToolMessage(m: ChatMessage): FormattedTool {
       };
     }
     default: {
+      if (/^task(_v\d+)?$/i.test(name) || /subagent/i.test(name)) {
+        return formatTaskTool(m, params, result, base);
+      }
       if (name.startsWith("mcp-") || name.includes("mcp")) {
         return {
           ...base,
