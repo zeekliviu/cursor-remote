@@ -151,8 +151,23 @@ function basenamePath(p: string): string {
 }
 
 const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|heic)$/i;
-const PHONE_ATTACH_RE =
-  /\[Phone attachments — read on host:\s*([^\](]+?)(?:\s*\([^)]*\))?\]/gi;
+const PHONE_ATTACH_BLOCK_RE =
+  /\[Phone attachments — read (?:on host|in workspace):\s*([^\]]+)\]/gi;
+
+function imagePathFromAttachmentSegment(segment: string): string | null {
+  const trimmed = String(segment || "").trim();
+  if (!trimmed) return null;
+  const preview = trimmed.match(/preview=(?:"([^"]+)"|([^;)]+))/i);
+  if (preview) {
+    const candidate = (preview[1] || preview[2] || "").trim();
+    if (candidate && isImagePath(candidate)) return candidate;
+  }
+  const pathPart = trimmed.replace(/\s*\([^)]*\)\s*$/, "").trim();
+  if (pathPart && isImagePath(pathPart) && fs.existsSync(pathPart)) {
+    return pathPart;
+  }
+  return null;
+}
 
 function isImagePath(p: string): boolean {
   return IMAGE_EXT_RE.test(p.trim());
@@ -209,9 +224,11 @@ function extractPhoneAttachmentPaths(text: string): {
 } {
   const paths: string[] = [];
   const cleaned = text
-    .replace(PHONE_ATTACH_RE, (_, p: string) => {
-      const trimmed = String(p || "").trim();
-      if (trimmed && isImagePath(trimmed)) paths.push(trimmed);
+    .replace(PHONE_ATTACH_BLOCK_RE, (_, block: string) => {
+      for (const segment of String(block || "").split(";")) {
+        const imagePath = imagePathFromAttachmentSegment(segment);
+        if (imagePath) paths.push(imagePath);
+      }
       return "";
     })
     .replace(/\n{3,}/g, "\n\n")

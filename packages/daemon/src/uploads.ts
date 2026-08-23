@@ -33,11 +33,23 @@ export function saveBase64Upload(
   };
 }
 
+function quotePreviewPath(filePath: string): string {
+  if (/[;\s]/.test(filePath)) return `"${filePath.replace(/"/g, '\\"')}"`;
+  return filePath;
+}
+
 export function formatAttachmentsForPrompt(files: AttachmentMeta[]): string {
   if (!files.length) return "";
   // Keep on one line — bare newlines in Composer submit/queue as a separate message.
-  const paths = files.map((f) => `${f.path} (${f.mime})`).join("; ");
-  return ` [Phone attachments — read on host: ${paths}]`;
+  const remote = files.some((f) => f.remotePath);
+  const segments = files.map((f) => {
+    if (f.remotePath) {
+      return `${f.remotePath} (${f.mime}; preview=${quotePreviewPath(f.path)})`;
+    }
+    return `${f.path} (${f.mime})`;
+  });
+  const label = remote ? "read in workspace" : "read on host";
+  return ` [Phone attachments — ${label}: ${segments.join("; ")}]`;
 }
 
 export function defaultDataDir(): string {

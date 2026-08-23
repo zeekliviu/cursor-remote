@@ -169,6 +169,8 @@ export type AttachmentMeta = {
   mime: string;
   path: string;
   size: number;
+  /** Linux path on an SSH-remote workspace after staging. */
+  remotePath?: string;
 };
 
 

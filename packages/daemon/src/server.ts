@@ -19,6 +19,7 @@ import { CursorStore } from "./cursor-store.js";
 import { getProjectDiff } from "./git-diff.js";
 import { ensureDir, resolveCursorPaths } from "./paths.js";
 import { pickAdvertiseHost, detectAdvertiseHosts } from "./advertise-host.js";
+import { stageAttachmentsForProject } from "./remote-workspace.js";
 import { formatAttachmentsForPrompt, saveBase64Upload } from "./uploads.js";
 import { TerminalHub, ensurePtyPermissions } from "./terminal.js";
 import { activateCursorApp } from "./open-cursor.js";
@@ -360,7 +361,7 @@ ${qrDataUrl ? `<p><img alt="pairing qr" src="${qrDataUrl}"/></p>` : ""}
     const attachmentPaths = Array.isArray(req.body?.attachmentPaths)
       ? (req.body.attachmentPaths as string[])
       : [];
-    const attachments = attachmentPaths
+    let attachments = attachmentPaths
       .filter((p) => typeof p === "string" && p.length > 0)
       .map((p) => ({
         id: "",
@@ -369,16 +370,19 @@ ${qrDataUrl ? `<p><img alt="pairing qr" src="${qrDataUrl}"/></p>` : ""}
         path: p,
         size: 0,
       }));
-    const full =
-      text.trim() + formatAttachmentsForPrompt(attachments);
-    if (!full.trim()) {
-      res.status(400).json({ error: "text or attachments required" });
-      return;
-    }
     try {
       const projectId =
         typeof req.body?.projectId === "string" ? req.body.projectId : undefined;
       const project = projectId ? store.getProject(projectId) : undefined;
+      if (project && attachments.length) {
+        attachments = await stageAttachmentsForProject(attachments, project);
+      }
+      const full =
+        text.trim() + formatAttachmentsForPrompt(attachments);
+      if (!full.trim()) {
+        res.status(400).json({ error: "text or attachments required" });
+        return;
+      }
       const chatName =
         typeof req.body?.chatName === "string" ? req.body.chatName : undefined;
       const chatId =
