@@ -23,15 +23,17 @@ Skip Play developer **account verification** (already done). Work top to bottom.
 - [x] **Commit + push** `docs/privacy.md` (and Play prep) to public `main` — https://github.com/zeekliviu/cursor-remote/blob/main/docs/privacy.md
 - [ ] Optional: replace mockup screenshots with device captures before Production
 
-## Play Console (you)
+## Play Console (you — remaining)
+
+Upload using your logged-in Play session. Copy/paste pack + local AAB path: [`INTERNAL_UPLOAD.md`](./INTERNAL_UPLOAD.md).
 
 - [ ] Create app “Cursor Remote” (free / productivity)
 - [ ] Store listing: paste short/full description; upload icon, feature graphic, screenshots
-- [ ] Privacy policy URL (GitHub `docs/privacy.md` on `main`)
+- [ ] Privacy policy URL — https://github.com/zeekliviu/cursor-remote/blob/main/docs/privacy.md
 - [ ] Data safety form (`DATA_SAFETY.md`)
 - [ ] Content rating questionnaire (`CONTENT_RATING.md`)
-- [ ] Target audience / news / COVID / ads declarations (no ads; not for children; not a news app)
-- [ ] Internal testing track → upload AAB (or `eas submit`)
+- [ ] Target audience / news / COVID / ads declarations (`DECLARATIONS.md`)
+- [ ] Internal testing → upload `store/google-play/releases/cursor-remote-1.0.0-vc1.aab`
 - [ ] Smoke-test installed build (pair, chat, photo, approval)
 - [ ] Promote when ready (closed → production)
 
