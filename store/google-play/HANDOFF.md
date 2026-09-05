@@ -77,7 +77,7 @@ When Internal testing looks good → promote to Production (or closed testing fi
 
 ## Remaining manual TODOs
 
-- [ ] Commit + push (privacy URL live)
+- [x] Commit + push (privacy URL live)
 - [x] `eas login` + `eas init`  
 - [x] First production AAB + keystore — [AAB](https://expo.dev/artifacts/eas/hYZ4H4AJKSJMY47FwqNsflmTlv6IAQO5XNR3F0bxa54.aab)  
 - [ ] Play Console forms + Internal track upload (use `screenshots/` + `icon-512.png` + `feature-graphic.png`)  

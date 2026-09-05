@@ -20,7 +20,7 @@ Skip Play developer **account verification** (already done). Work top to bottom.
 - [x] Asset validator (`npm run validate:play`)
 - [x] `eas login` + `eas init` (project `d3b29486-57c5-4990-b7e9-d7f7a34b9175`)
 - [x] First production **AAB** — [download](https://expo.dev/artifacts/eas/hYZ4H4AJKSJMY47FwqNsflmTlv6IAQO5XNR3F0bxa54.aab) · local `store/google-play/releases/cursor-remote-1.0.0-vc1.aab` · [build logs](https://expo.dev/accounts/zeekliviu/projects/cursor-remote/builds/4eea0978-3e8b-4d78-9dbf-8bd9a4624131)
-- [ ] **Commit + push** `docs/privacy.md` (and Play prep) to public `main` — URL then works; no gist needed
+- [x] **Commit + push** `docs/privacy.md` (and Play prep) to public `main` — https://github.com/zeekliviu/cursor-remote/blob/main/docs/privacy.md
 - [ ] Optional: replace mockup screenshots with device captures before Production
 
 ## Play Console (you)
