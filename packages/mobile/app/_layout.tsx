@@ -19,6 +19,7 @@ export default function RootLayout() {
           >
             <Stack.Screen name="index" options={{ title: "Cursor Remote" }} />
             <Stack.Screen name="pair" options={{ title: "Add host" }} />
+            <Stack.Screen name="about" options={{ title: "About" }} />
             <Stack.Screen
               name={"projects/[id]"}
               options={{ title: "Project" }}

@@ -17,13 +17,16 @@
     "daemon:dev": "npm run dev -w @cursor-remote/daemon",
     "mobile": "npm run start -w @cursor-remote/mobile -- --clear",
     "mobile:start": "npm run start -w @cursor-remote/mobile --",
+    "mobile:build:android": "npm run build:android -w @cursor-remote/mobile",
+    "mobile:submit:android": "npm run submit:android -w @cursor-remote/mobile",
+    "validate:play": "node ./scripts/validate-play-assets.mjs",
     "test:ux": "tsx --test packages/mobile/lib/chat-turns.test.ts"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.13"
   },
   "overrides": {
-    "react": "19.1.0",
-    "react-native": "0.81.4"
+    "react": "19.2.3",
+    "react-native": "0.86.3"
   }
 }

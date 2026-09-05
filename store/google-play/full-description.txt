@@ -1,0 +1,14 @@
+Cursor Remote turns your phone into a companion for Cursor on your Mac or Windows PC.
+
+Pair over Wi‑Fi, VPN, or Tailscale with a QR code from the host daemon. Then:
+
+• Browse projects and open agent chats
+• Send follow-ups, queue messages, and stop the agent
+• Approve or deny tool requests when Cursor needs you
+• Switch models and options from your phone
+• Attach photos to Composer
+• Open a project terminal when you need a shell
+
+Everything stays on your machine. The phone talks only to the daemon you run locally — there is no Cursor Remote cloud account and no analytics backend.
+
+Requirements: Cursor IDE with remote debugging, the open-source Cursor Remote daemon on the same network as your phone, and Expo/Android build from this project.

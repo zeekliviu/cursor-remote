@@ -67,11 +67,14 @@ Cursor’s agent loop is powerful on a big screen — and awkward when you step 
 
 ## Prerequisites
 
-- [Node.js](https://nodejs.org/) **≥ 20**
+- Node.js **≥ 20** (mobile/EAS: **≥ 22.13** recommended for Expo SDK 57)
+
 - [Cursor](https://cursor.com/) installed
 - Phone on the same network / Tailscale / VPN as the host
 - **Windows:** [Visual C++ Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) (for `node-pty` + `better-sqlite3`)
 - Optional: [Expo Go](https://expo.dev/go) for development
+- **Privacy policy:** [docs/privacy.md](./docs/privacy.md) — [view on GitHub](https://github.com/zeekliviu/cursor-remote/blob/main/docs/privacy.md)
+- **Google Play prep:** [store/google-play/CHECKLIST.md](./store/google-play/CHECKLIST.md) · [HANDOFF.md](./store/google-play/HANDOFF.md)
 
 ---
 

@@ -76,6 +76,9 @@ import { WorkSummaryRow } from "../../lib/work-summary-row";
 const DRAFT_KEY = (chatId: string) => `cursor-remote:draft:${chatId}`;
 /** How close to the bottom still counts as "following the conversation". */
 const NEAR_BOTTOM_PX = 80;
+/** First paint shows only the newest turns; scroll up to reveal older ones. */
+const INITIAL_TURN_WINDOW = 16;
+const OLDER_TURN_PAGE = 16;
 const SLASH_COMMANDS = [
   { command: "/plan", label: "Plan first" },
   { command: "/review", label: "Review changes" },
@@ -251,14 +254,7 @@ export default function ChatScreen() {
   const scrollRef = useRef<FlatList<ChatTurn>>(null);
   const lastLenRef = useRef(0);
   const nearBottomRef = useRef(true);
-  /**
-   * True while a chat is opening. During this window we ignore user-scroll
-   * signals and aggressively re-pin to the bottom on every content-size
-   * change so that opening a long transcript never lands mid-conversation.
-   * FlatList lazy-renders items in windows, so a single `scrollToEnd` call
-   * often lands at the current partial bottom before more items mount.
-   */
-  const initialLoadRef = useRef(true);
+  /** Inverted list: offset ~0 is the latest messages (visual bottom). */
   const projectIdParam = typeof projectId === "string" ? projectId : undefined;
   const hostId = client
     ? client.connection.id ||
@@ -291,6 +287,9 @@ export default function ChatScreen() {
   const [bindHint, setBindHint] = useState<string | null>(null);
   const [atBottom, setAtBottom] = useState(true);
   const [newCount, setNewCount] = useState(0);
+  /** Extra older turns beyond the initial tail window (grows on scroll-up). */
+  const [olderCount, setOlderCount] = useState(0);
+  const loadingOlderRef = useRef(false);
   const [imageViewer, setImageViewer] = useState<{
     images: ImageViewerImage[];
     index: number;
@@ -329,6 +328,29 @@ export default function ChatScreen() {
         : turn,
     );
   }, [chat, completions, id]);
+
+  useEffect(() => {
+    setOlderCount(0);
+    nearBottomRef.current = true;
+    setAtBottom(true);
+    setNewCount(0);
+  }, [id]);
+
+  const historyStart = Math.max(
+    0,
+    turns.length - INITIAL_TURN_WINDOW - olderCount,
+  );
+  const visibleTurns = useMemo(
+    () => turns.slice(historyStart),
+    [turns, historyStart],
+  );
+  /** Newest-first for inverted FlatList (index 0 = latest at visual bottom). */
+  const listTurns = useMemo(
+    () => [...visibleTurns].reverse(),
+    [visibleTurns],
+  );
+  const hasOlder = historyStart > 0;
+  const latestTurnId = turns.length ? turns[turns.length - 1]?.id : null;
   const cdpOk = Boolean(health?.cdpReachable && health?.selectorsOk);
   const hostAgentRunning = Boolean(agentStatus);
   const agentRunning = hostAgentRunning || busy;
@@ -348,23 +370,13 @@ export default function ChatScreen() {
   const showJumpPill = !atBottom;
 
   const scrollBottom = useCallback((animated = true) => {
+    // Inverted list: offset 0 is the visual bottom (latest).
     requestAnimationFrame(() =>
-      scrollRef.current?.scrollToEnd({ animated }),
+      scrollRef.current?.scrollToOffset({ offset: 0, animated }),
     );
   }, []);
 
-  /**
-   * Called on content-size grow and during live streaming. While the chat
-   * is still opening we always re-pin to the bottom (no animation, so it
-   * looks like the chat "just opened at the latest" instead of scrolling).
-   * After the initial-load window closes we only follow when the user is
-   * still near the tail.
-   */
   const followBottom = useCallback(() => {
-    if (initialLoadRef.current) {
-      scrollBottom(false);
-      return;
-    }
     if (!nearBottomRef.current) return;
     scrollBottom(true);
   }, [scrollBottom]);
@@ -376,39 +388,26 @@ export default function ChatScreen() {
     scrollBottom(true);
   }, [scrollBottom]);
 
+  const loadOlder = useCallback(() => {
+    if (!hasOlder || loadingOlderRef.current) return;
+    loadingOlderRef.current = true;
+    setOlderCount((n) => n + OLDER_TURN_PAGE);
+    requestAnimationFrame(() => {
+      loadingOlderRef.current = false;
+    });
+  }, [hasOlder]);
+
   const onScroll = useCallback(
     (e: NativeSyntheticEvent<NativeScrollEvent>) => {
-      // Ignore layout-driven scrolls during the open animation — otherwise
-      // FlatList's lazy renders (which briefly report contentSize < real
-      // size) flip nearBottomRef to false and freeze the chat mid-scroll.
-      if (initialLoadRef.current) return;
-      const { contentOffset, contentSize, layoutMeasurement } = e.nativeEvent;
-      const distance =
-        contentSize.height - contentOffset.y - layoutMeasurement.height;
-      const near = distance < NEAR_BOTTOM_PX;
+      const { contentOffset } = e.nativeEvent;
+      // Inverted: near the latest messages when offset is small.
+      const near = contentOffset.y < NEAR_BOTTOM_PX;
       nearBottomRef.current = near;
       setAtBottom((prev) => (prev === near ? prev : near));
       if (near) setNewCount((c) => (c === 0 ? c : 0));
     },
     [],
   );
-
-  // Reset the "opening" pin whenever the visible chat changes. 1200ms is
-  // enough for FlatList to mount + render a couple of lazy batches; after
-  // that we honor the user's real scroll position.
-  useEffect(() => {
-    initialLoadRef.current = true;
-    nearBottomRef.current = true;
-    setAtBottom(true);
-    setNewCount(0);
-    const timer = setTimeout(() => {
-      initialLoadRef.current = false;
-      // One last scroll after the pin releases in case FlatList grew again
-      // in the final tick before we stopped forcing the tail.
-      scrollBottom(false);
-    }, 1200);
-    return () => clearTimeout(timer);
-  }, [id, scrollBottom]);
 
   const applyChatUpdate = useCallback((detail: ChatDetail) => {
     // Counted outside the updater so a re-invoked updater can't double-count.
@@ -905,9 +904,11 @@ export default function ChatScreen() {
   }
 
   const renderTurn = useCallback(
-    (turn: ChatTurn, index: number) => {
+    (turn: ChatTurn) => {
       if (!chat) return null;
-      const isLatest = index === turns.length - 1;
+      const chronoIndex = turns.findIndex((t) => t.id === turn.id);
+      const index = chronoIndex >= 0 ? chronoIndex : turns.length - 1;
+      const isLatest = turn.id === latestTurnId;
       const isActive = isLatest && hostAgentRunning;
       const guidance = getDefaultExpansionGuidance(turn, {
         density,
@@ -1112,12 +1113,13 @@ export default function ChatScreen() {
       hostLabels,
       hostStartedAt,
       id,
+      latestTurnId,
       mediaUrlFor,
       onMarkdownLink,
       openMessageImages,
       projectIdParam,
       turnExpansion,
-      turns.length,
+      turns,
     ],
   );
 
@@ -1145,20 +1147,45 @@ export default function ChatScreen() {
     >
       <FlatList
         ref={scrollRef}
-        data={turns}
+        data={listTurns}
+        inverted
         keyExtractor={(turn) => turn.id}
-        renderItem={({ item, index }) => renderTurn(item, index)}
+        renderItem={({ item }) => renderTurn(item)}
         contentContainerStyle={styles.container}
         onContentSizeChange={followBottom}
         onScroll={onScroll}
         scrollEventThrottle={32}
+        onEndReached={loadOlder}
+        onEndReachedThreshold={0.4}
+        maintainVisibleContentPosition={{
+          minIndexForVisible: 1,
+        }}
         removeClippedSubviews={Platform.OS === "android"}
         keyboardShouldPersistTaps="handled"
-        initialNumToRender={6}
-        maxToRenderPerBatch={6}
-        windowSize={7}
+        initialNumToRender={INITIAL_TURN_WINDOW}
+        maxToRenderPerBatch={8}
+        windowSize={9}
         ListHeaderComponent={
-          <View style={styles.listHeader}>
+          <View style={styles.invertedFlip}>
+            <View style={{ height: 8 }} />
+          </View>
+        }
+        ListFooterComponent={
+          <View style={[styles.listHeader, styles.invertedFlip]}>
+            {hasOlder ? (
+              <Pressable
+                onPress={loadOlder}
+                style={({ pressed }) => [
+                  styles.loadOlderBtn,
+                  pressed && styles.pressedSoft,
+                ]}
+                accessibilityLabel="Load older messages"
+              >
+                <Text style={styles.loadOlderText}>↑ Earlier messages</Text>
+              </Pressable>
+            ) : turns.length > 0 ? (
+              <Text style={styles.loadOlderDone}>Beginning of chat</Text>
+            ) : null}
             {!messageable ? (
               <View style={styles.readonlyBanner}>
                 <Text style={styles.readonlyTitle}>View only</Text>
@@ -1201,9 +1228,6 @@ export default function ChatScreen() {
             {live ? <Text style={styles.live}>{live}</Text> : null}
             {bindHint ? <Text style={styles.bindHint}>{bindHint}</Text> : null}
           </View>
-        }
-        ListFooterComponent={
-          <View onLayout={followBottom} style={{ height: 1 }} />
         }
       />
 
@@ -1520,8 +1544,30 @@ const styles = StyleSheet.create({
     fontSize: 11,
     lineHeight: 14,
   },
-  container: { padding: 16, gap: 10, paddingBottom: 24 },
-  listHeader: { gap: 8 },
+  container: { padding: 16, gap: 10, paddingTop: 8, paddingBottom: 24 },
+  /** Counteract FlatList `inverted` scaleY(-1) on sticky chrome. */
+  invertedFlip: { transform: [{ scaleY: -1 }] },
+  listHeader: { gap: 8, paddingBottom: 8 },
+  loadOlderBtn: {
+    alignSelf: "center",
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: 999,
+    backgroundColor: "#ebe4d6",
+    marginBottom: 4,
+  },
+  loadOlderText: {
+    color: "#5f584e",
+    fontSize: 13,
+    fontWeight: "700",
+  },
+  loadOlderDone: {
+    alignSelf: "center",
+    color: "#9a9286",
+    fontSize: 12,
+    fontWeight: "600",
+    marginBottom: 6,
+  },
   densityButton: {
     color: "#5f584e",
     fontSize: 12,

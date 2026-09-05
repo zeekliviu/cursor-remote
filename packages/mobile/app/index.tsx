@@ -120,6 +120,12 @@ export default function HomeScreen() {
         <Pressable style={styles.primary} onPress={() => router.push("/pair")}>
           <Text style={styles.primaryText}>Add host</Text>
         </Pressable>
+        <Pressable
+          style={styles.secondary}
+          onPress={() => router.push("/about")}
+        >
+          <Text style={styles.secondaryText}>About & privacy</Text>
+        </Pressable>
       </View>
     );
   }
@@ -300,6 +306,12 @@ export default function HomeScreen() {
       >
         <Text style={styles.secondaryText}>Clear all hosts</Text>
       </Pressable>
+      <Pressable
+        style={styles.aboutLink}
+        onPress={() => router.push("/about")}
+      >
+        <Text style={styles.aboutLinkText}>About & privacy</Text>
+      </Pressable>
     </ScrollView>
   );
 }
@@ -395,6 +407,17 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   secondaryText: { color: "#8a4030", fontWeight: "600" },
+  aboutLink: {
+    marginTop: 4,
+    paddingVertical: 10,
+    alignItems: "center",
+  },
+  aboutLinkText: {
+    color: "#6f685c",
+    fontSize: 13,
+    fontWeight: "600",
+    textDecorationLine: "underline",
+  },
   banner: { borderRadius: 12, padding: 12 },
   bannerOk: { backgroundColor: "#e5f0e2" },
   bannerWarn: { backgroundColor: "#f5e6d2" },

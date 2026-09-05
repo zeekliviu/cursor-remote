@@ -17,13 +17,26 @@ auth.json
 
 # Native / Expo leftovers
 *.jks
+*.keystore
 *.p8
 *.p12
 *.mobileprovision
 *.orig.*
 web-build/
+.tmp-export/
+eas-build*.log
+eas-build*.json
 android/
 ios/
+credentials.json
+google-services.json
+**/play-service-account.json
+.eas/credentials/
+store/google-play/releases/*
+!store/google-play/releases/.gitkeep
+# Keep listing screenshots in git; ignore oversized local dumps if added later
+store/google-play/screenshots/*.mov
+store/google-play/screenshots/*.mp4
 
 # Editor
 .idea/

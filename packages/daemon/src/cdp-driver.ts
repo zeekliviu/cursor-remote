@@ -1386,14 +1386,26 @@ export class CdpDriver {
     return picker;
   }
 
-  /** Nested Model submenu — Cursor puts Effort/Context triggers BEFORE Model. */
-  private async expandModelSubmenu(page: Page): Promise<void> {
-    const opened = await page.evaluate(() => {
+  /**
+   * Nested Model submenu — Cursor puts Effort/Context BEFORE Model.
+   * Must open the real model list (not treat params-panel "Auto" as ready).
+   */
+  private async expandModelSubmenu(page: Page): Promise<boolean> {
+    await page.evaluate(() => {
+      document
+        .querySelectorAll("[data-cursor-remote-model-trigger]")
+        .forEach((el) => el.removeAttribute("data-cursor-remote-model-trigger"));
+    });
+
+    const marked = await page.evaluate(() => {
       const normalize = (s: string) =>
         s
           .replace(/[\u200b-\u200d\ufeff]/g, "")
           .replace(/\s+/g, " ")
           .trim();
+      const firstLine = (el: Element | null) =>
+        normalize((el as HTMLElement | null)?.innerText || "").split("\n")[0] ||
+        "";
 
       const triggers = Array.from(
         document.querySelectorAll(
@@ -1401,53 +1413,93 @@ export class CdpDriver {
         ),
       ) as HTMLElement[];
 
-      // Left label in item-content is "Model"; right side holds the name.
-      const modelTrigger =
-        triggers.find((el) => {
-          const content = el.querySelector(
-            '[data-component="menu-item-content"], .ui-menu__item-content',
-          ) as HTMLElement | null;
-          const left = normalize(content?.innerText || "")
-            .split("\n")[0]
-            .trim();
-          return /^model$/i.test(left);
-        }) ||
-        triggers.find((el) => {
-          const full = normalize(el.innerText || "").split("\n")[0] || "";
-          return /^model\b/i.test(full);
-        });
+      const leftLabel = (el: HTMLElement) => {
+        const content = el.querySelector(
+          '[data-component="menu-item-content"], .ui-menu__item-content',
+        ) as HTMLElement | null;
+        return firstLine(content).split(/\s+/)[0] || "";
+      };
+
+      const inModelSection = (el: HTMLElement) => {
+        const group = el.closest(
+          '[role="group"], .ui-menu__section, [data-menu-section]',
+        ) as HTMLElement | null;
+        if (!group) return false;
+        if (/^model$/i.test(group.getAttribute("aria-label") || "")) return true;
+        const title = firstLine(
+          group.querySelector(
+            '.ui-menu__section-title, [data-component="menu-section-title"]',
+          ),
+        );
+        return /^model$/i.test(title);
+      };
+
+      // 1) Left label "Model" (concrete models).
+      let modelTrigger =
+        triggers.find((el) => /^model$/i.test(leftLabel(el))) || null;
+
+      // 2) Auto panel: footer/group titled Model, trigger text is just "Auto".
+      if (!modelTrigger) {
+        modelTrigger =
+          triggers.find((el) => inModelSection(el)) ||
+          triggers.find(
+            (el) => el.getAttribute("data-ui-menu-item-region") === "footer",
+          ) ||
+          null;
+      }
+
+      // 3) Combined first line "Model …".
+      if (!modelTrigger) {
+        modelTrigger =
+          triggers.find((el) => /^model\b/i.test(firstLine(el))) || null;
+      }
 
       if (!modelTrigger) return false;
-      modelTrigger.dispatchEvent(
-        new MouseEvent("mouseover", { bubbles: true, cancelable: true }),
-      );
-      modelTrigger.click();
+      modelTrigger.setAttribute("data-cursor-remote-model-trigger", "1");
       return true;
     });
 
-    if (!opened) return;
+    if (!marked) return false;
 
-    const deadline = Date.now() + 2500;
+    const handle = await page.$('[data-cursor-remote-model-trigger="1"]');
+    if (!handle) return false;
+    try {
+      const box = await handle.boundingBox();
+      if (box) {
+        // Real pointer hover — Cursor's Model flyout often ignores synthetic mouseover.
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+        await new Promise((r) => setTimeout(r, 280));
+      }
+      await handle.click({ delay: 40 }).catch(async () => {
+        await handle.evaluate((el) => (el as HTMLElement).click());
+      });
+    } finally {
+      await handle.dispose().catch(() => undefined);
+    }
+
+    const deadline = Date.now() + 3000;
     while (Date.now() < deadline) {
       const ready = await page.evaluate(() => {
-        const names = document.querySelectorAll(
-          ".ui-model-picker__item-content-name, [class*='model-picker__item-content-name']",
-        ).length;
         const list = document.querySelector(
           '[data-testid="selected-model-list-submenu"]',
         );
-        const auto = Array.from(
-          document.querySelectorAll('[role="menuitem"]'),
-        ).some((n) =>
-          /^auto$/i.test(
-            ((n as HTMLElement).innerText || "").trim().split("\n")[0] || "",
-          ),
+        if (list) {
+          // Require real rows inside the list — not the params-panel Auto item.
+          const rows = list.querySelectorAll(
+            '[role="menuitem"], .ui-model-picker__item-content-name, [class*="model-picker__item-content-name"]',
+          );
+          return rows.length > 0;
+        }
+        return (
+          document.querySelectorAll(
+            ".ui-model-picker__item-content-name, [class*='model-picker__item-content-name']",
+          ).length > 0
         );
-        return names > 0 || Boolean(list) || auto;
       });
-      if (ready) break;
+      if (ready) return true;
       await new Promise((r) => setTimeout(r, 100));
     }
+    return false;
   }
 
   private async openParamSubmenu(
@@ -1873,11 +1925,20 @@ export class CdpDriver {
       if (!picker) return false;
 
       const isAuto = /^auto$/i.test(config.modelLabel.trim());
-      await this.expandModelSubmenu(page);
+      const expanded = await this.expandModelSubmenu(page);
+      if (!expanded) {
+        await page.keyboard.press("Escape").catch(() => undefined);
+        return false;
+      }
       const clicked = await this.clickModelInSubmenu(page, config.modelLabel);
+      if (!clicked) {
+        await page.keyboard.press("Escape").catch(() => undefined);
+        return false;
+      }
+      // Give Cursor time to rebuild the params panel after leaving Auto.
+      await new Promise((r) => setTimeout(r, 350));
       await page.keyboard.press("Escape").catch(() => undefined);
-      await new Promise((r) => setTimeout(r, 250));
-      if (!clicked) return false;
+      await new Promise((r) => setTimeout(r, 200));
       if (isAuto) return true;
 
       const choices = config.choices || {};
@@ -1961,7 +2022,13 @@ export class CdpDriver {
 
       // Model list first — scrapeParamsPanel opens Effort/Context submenus
       // and Escapes, which must not run before we expand the Model row.
-      await this.expandModelSubmenu(page);
+      const expanded = await this.expandModelSubmenu(page);
+      if (!expanded) {
+        await page.keyboard.press("Escape").catch(() => undefined);
+        throw new Error(
+          "could not open Model submenu — hover Model in Cursor's picker and retry",
+        );
+      }
 
       const scraped = await page.evaluate(() => {
         const normalize = (s: string) =>
@@ -2107,7 +2174,9 @@ export class CdpDriver {
       if (modelLabel && !/^auto$/i.test(modelLabel.trim())) {
         const picker = await this.openModelPicker(page);
         if (!picker) throw new Error("model picker not found");
-        await this.expandModelSubmenu(page);
+        if (!(await this.expandModelSubmenu(page))) {
+          throw new Error("could not open Model submenu");
+        }
         const ok = await this.clickModelInSubmenu(page, modelLabel);
         await page.keyboard.press("Escape").catch(() => undefined);
         await new Promise((r) => setTimeout(r, 250));
@@ -2115,7 +2184,9 @@ export class CdpDriver {
       } else if (modelLabel && /^auto$/i.test(modelLabel.trim())) {
         const picker = await this.openModelPicker(page);
         if (!picker) throw new Error("model picker not found");
-        await this.expandModelSubmenu(page);
+        if (!(await this.expandModelSubmenu(page))) {
+          throw new Error("could not open Model submenu");
+        }
         await this.clickModelInSubmenu(page, "Auto");
         await page.keyboard.press("Escape").catch(() => undefined);
         await new Promise((r) => setTimeout(r, 250));
